@@ -361,6 +361,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Whether to store prev_latents_mean for KL regularization.",
             )
             parser.add_argument(
+                "--diffusion-weight-update-from-disk",
+                action="store_true",
+                help="Whether to update diffusion weights from disk. Currently only for single-node debugging.",
+            )
+            parser.add_argument(
+                "--diffusion-weight-update-from-disk-buffer-path",
+                type=str,
+                default=None,
+                help="Path to the buffer containing diffusion weights to update from. Currently only for single-node debugging.",
+            )
+            parser.add_argument(
                 "--diffusion-reward",
                 type=str,
                 default="pickscore",

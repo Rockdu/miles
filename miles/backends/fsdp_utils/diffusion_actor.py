@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from argparse import Namespace
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -82,6 +83,7 @@ class DiffusionFSDPTrainRayActor(TrainRayActor):
             raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
 
         self.lr_scheduler = get_lr_scheduler(args, self.optimizer)
+        logger.info(f"lr_scheduler states: {self.lr_scheduler.__dict__}")
         self.global_step = 0
         self.ema = None
         self.ema_parameters = None
@@ -126,6 +128,18 @@ class DiffusionFSDPTrainRayActor(TrainRayActor):
 
     def update_weights(self) -> None:  # type: ignore[override]
         # Diffusion rollout does not use rollout engines yet, so there is nothing to sync.
+        if self.args.diffusion_weight_update_from_disk:
+            weight_buffer_path = getattr(self.args, "diffusion_weight_update_from_disk_buffer_path", None)
+            assert weight_buffer_path is not None, "buffer path must be provided if diffusion_weight_update_from_disk is True"
+
+            dist.barrier(group=get_gloo_group())
+            if dist.get_rank() == 0:
+                logger.info(f"dist Rank {dist.get_rank()} updating diffusion weights from disk buffer.")
+                torch.save(self.pipeline.transformer.state_dict(), weight_buffer_path)
+            dist.barrier(group=get_gloo_group())
+        else:
+            # error: update weights from disk is not implemented yet, raise error to avoid silent failure
+            raise NotImplementedError("other diffusion weights update options are not implemented yet.")
         return
 
     def connect_actor_critic(self, critic_group) -> None:  # type: ignore[override]

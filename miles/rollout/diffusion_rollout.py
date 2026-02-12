@@ -47,6 +47,7 @@ def set_rollout_pg(pg) -> None:
 class DiffusionRolloutWorker:
     def __init__(self, args: Namespace) -> None:
         self.args = args
+        
 
     def run_group(self, rollout_id: int, group: list[Sample], evaluation: bool = False) -> list[Sample]:
         return _run_rollout_group(self.args, rollout_id, group, evaluation)
@@ -115,6 +116,15 @@ def _get_pipeline(args: Namespace) -> StableDiffusion3Pipeline:
     dtype = _get_dtype(args)
     device = _get_device(args)
     _PIPELINE = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=dtype)
+
+    if (args.diffusion_weight_update_from_disk) :
+        logger.info("Updating diffusion weights from disk buffer before rollout.")
+        weight_buffer_path = getattr(args, "diffusion_weight_update_from_disk_buffer_path", None)
+        assert weight_buffer_path is not None, "buffer path must be provided if diffusion_weight_update_from_disk is True"
+        _PIPELINE.transformer.load_state_dict(weight_buffer_path)
+    else:
+       raise NotImplementedError("Other diffusion weights updates are not implemented yet; please set diffusion_weight_update_from_disk to True and provide a buffer path.")
+    
     _PIPELINE.to(device)
     return _PIPELINE
 
