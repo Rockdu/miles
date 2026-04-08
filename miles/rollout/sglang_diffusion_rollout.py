@@ -61,7 +61,7 @@ def build_rollout_sampling_params(
                 "rollout_noise_level": float(getattr(args, "diffusion_rollout_noise_level", 0.7)),
                 "rollout_log_prob_no_const": bool(getattr(args, "diffusion_rollout_log_prob_no_const", False)),
                 "rollout_debug_mode": bool(getattr(args, "diffusion_rollout_debug_mode", False)),
-                "rollout_return_dit_env": True,
+                "rollout_return_denoising_env": True,
                 "rollout_return_dit_trajectory": True,
             }
         )
@@ -81,7 +81,7 @@ def build_rollout_generate_payload(
     """
     sampling_params["prompt"] = prompt
     if sampling_params["negative_prompt"] is None:
-        sampling_params["negative_prompt"] = [" "] * len(prompt)  # FlowGRPO default
+        sampling_params["negative_prompt"] = " "  # FlowGRPO default
     sampling_params["num_outputs_per_prompt"] = num_outputs_per_prompt
     return sampling_params
 

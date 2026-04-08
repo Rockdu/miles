@@ -50,13 +50,36 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
-    from sglang.multimodal_gen.runtime.launch_server import launch_server
+def _patched_launch_server_target(server_args):
+    # addict.Dict loses its `__frozen` instance attribute when pickled across the
+    # spawn boundary (dict subclass pickling skips instance __dict__), which makes
+    # any default-key access on `server_args.attention_backend_config` raise
+    # `AttributeError: 'Dict' object has no attribute '__frozen'`. Patch __missing__
+    # to lazily restore the flag in the child process before launching the server.
+    import addict
 
+    _orig_missing = addict.Dict.__missing__
+
+    def _safe_missing(self, key):
+        try:
+            return _orig_missing(self, key)
+        except AttributeError:
+            object.__setattr__(self, "__frozen", False)
+            object.__setattr__(self, "__parent", None)
+            object.__setattr__(self, "__key", None)
+            return _orig_missing(self, key)
+
+    addict.Dict.__missing__ = _safe_missing
+
+    from sglang.multimodal_gen.runtime.launch_server import launch_server
+    launch_server(server_args)
+
+
+def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # use spawn to avoid potential risks of fork in terms of subthreads or CUDA.
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    p = multiprocessing.Process(target=_patched_launch_server_target, args=(server_args,))
     p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:

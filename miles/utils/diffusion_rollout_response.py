@@ -15,6 +15,7 @@ from miles.utils.types import (
     Sample,
     decode_tensor_base64,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import base64_to_tensor
 
 __all__ = [
     "apply_rollout_image_response",
@@ -28,10 +29,10 @@ _ROLLOUT_LOG_PROB_PRIMARY_KEYS = ("log_prob", "log_probs", "total", "per_step")
 def _default_deserialize_func(value: Any) -> torch.Tensor | None:
     if value is None:
         return None
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
     if isinstance(value, str):
         return decode_tensor_base64(value).detach().cpu()
+    if isinstance(value, dict) and value.get("__tensor__"):
+        return base64_to_tensor(value["data"]).detach().cpu()
     raise TypeError(f"Cannot deserialize {type(value)}")
 
 
@@ -40,17 +41,8 @@ def _deserialize_rollout_log_probs(
     *,
     deserialize_func: Callable[[Any], torch.Tensor | None],
 ) -> torch.Tensor | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        for key in _ROLLOUT_LOG_PROB_PRIMARY_KEYS:
-            if key in value and value[key] is not None:
-                return deserialize_func(value[key])
-        for candidate in value.values():
-            if candidate is not None:
-                return deserialize_func(candidate)
-        return None
-    return deserialize_func(value)
+    assert isinstance(value, dict) and value.get("__tensor__") is not None
+    return deserialize_func(value["data"]).detach().cpu()
 
 
 def _parse_cond_kwargs(

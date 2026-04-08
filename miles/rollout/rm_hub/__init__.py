@@ -39,7 +39,6 @@ async def async_rm(args, sample: Sample, **kwargs):
 
     rm_type = _resolve_rm_type(args, sample)
 
-    label = sample.label
     if rm_type.startswith("boxed_"):
         response = extract_boxed_answer(response) or ""
         rm_type = rm_type[len("boxed_") :]

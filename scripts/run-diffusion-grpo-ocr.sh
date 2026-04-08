@@ -18,7 +18,7 @@ pkill -9 python
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES=2,3
 # WandB: enable if WANDB_API_KEY is present.
 RUN_NAME="diffusion_grpo_$(date +%Y%m%d_%H%M%S)"
 WANDB_ARGS=()
@@ -58,7 +58,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --use-miles-router \
   --diffusion-model Qwen/Qwen-Image \
   --diffusion-reward ocr:1.0 \
-  --reward-key ocr \
+  --rm-type ocr \
   --diffusion-dtype fp32 \
   --diffusion-num-steps 10 \
   --diffusion-num-batches-per-epoch 8 \
