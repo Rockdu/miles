@@ -1841,6 +1841,15 @@ def miles_validate_args(args):
             )
         args.global_batch_size = global_batch_size
 
+    # Diffusion path: if the user didn't pass --global-batch-size, derive it from
+    # the other knobs. Must equal gradient_accum × dp_size so the loss scaling in
+    # loss.py (`loss * num_microbatches / global_batch_size * dp_cp_size`) and the
+    # LR scheduler's `train_iters` come out right; exposing it as a separate CLI
+    # arg is legacy and error-prone.
+    if getattr(args, "diffusion_train", False) and args.global_batch_size is None:
+        dp_size = args.actor_num_gpus_per_node * args.actor_num_nodes
+        args.global_batch_size = args.diffusion_gradient_accumulation_steps * dp_size
+
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
         logger.info("n_samples_per_prompt is set to 1, grpo_std_normalization will be set to False.")

@@ -98,7 +98,6 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-sde-window-range 0,5 \
   --diffusion-height 256 \
   --diffusion-width 256 \
-  --global-batch-size 8 \
   --diffusion-debug-mode \
   --debug-skip-optimizer-step \
   "${WANDB_ARGS[@]}"

@@ -23,7 +23,7 @@ sleep 2
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # WandB: enable if WANDB_API_KEY is present.
 RUN_NAME="diffusion_grpo_$(date +%Y%m%d_%H%M%S)"
@@ -90,5 +90,4 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-sde-window-range 0,5 \
   --diffusion-height 512 \
   --diffusion-width 512 \
-  --global-batch-size 256 \
   "${WANDB_ARGS[@]}"
