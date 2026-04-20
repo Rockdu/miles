@@ -144,8 +144,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--diffusion-gradient-accumulation-steps",
                 type=int,
-                default=1,
-                help="Number of trajectories to accumulate per optimizer step (matches flow_grpo train.gradient_accumulation_steps).",
+                default=None,
+                help=(
+                    "Number of trajectories to accumulate per optimizer step per rank. "
+                    "Usually derived from --num-steps-per-rollout "
+                    "(accum = rollout_batch_size × n_samples_per_prompt / (num_steps_per_rollout × dp_size)); "
+                    "pass this explicitly only to override. Defaults to 1 if neither is supplied."
+                ),
             )
             parser.add_argument(
                 "--qkv-format",
@@ -1841,14 +1846,29 @@ def miles_validate_args(args):
             )
         args.global_batch_size = global_batch_size
 
-    # Diffusion path: if the user didn't pass --global-batch-size, derive it from
-    # the other knobs. Must equal gradient_accum × dp_size so the loss scaling in
-    # loss.py (`loss * num_microbatches / global_batch_size * dp_cp_size`) and the
-    # LR scheduler's `train_iters` come out right; exposing it as a separate CLI
-    # arg is legacy and error-prone.
-    if getattr(args, "diffusion_train", False) and args.global_batch_size is None:
+    # Diffusion path: --num-steps-per-rollout is the authoritative knob (matches
+    # flow_grpo's "N optimizer steps per epoch" semantics). Derive the two
+    # secondary quantities — diffusion_gradient_accumulation_steps and
+    # global_batch_size — from it. Both secondary quantities remain overridable
+    # via their own CLI flags; if explicitly set we assert consistency.
+    if getattr(args, "diffusion_train", False):
         dp_size = args.actor_num_gpus_per_node * args.actor_num_nodes
-        args.global_batch_size = args.diffusion_gradient_accumulation_steps * dp_size
+        if args.num_steps_per_rollout is not None:
+            samples_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt
+            derived_accum = samples_per_rollout // (args.num_steps_per_rollout * dp_size)
+            if args.diffusion_gradient_accumulation_steps is not None:
+                assert args.diffusion_gradient_accumulation_steps == derived_accum, (
+                    f"diffusion_gradient_accumulation_steps={args.diffusion_gradient_accumulation_steps} "
+                    f"inconsistent with num_steps_per_rollout={args.num_steps_per_rollout} "
+                    f"(samples_per_rollout={samples_per_rollout} / "
+                    f"(num_steps_per_rollout={args.num_steps_per_rollout} × dp_size={dp_size}) "
+                    f"= {derived_accum}). Drop one of the two."
+                )
+            args.diffusion_gradient_accumulation_steps = derived_accum
+        if args.diffusion_gradient_accumulation_steps is None:
+            args.diffusion_gradient_accumulation_steps = 1
+        if args.global_batch_size is None:
+            args.global_batch_size = args.diffusion_gradient_accumulation_steps * dp_size
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
