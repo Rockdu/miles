@@ -33,6 +33,26 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+def _scheduler_process_with_qwen_image_patch(*args, **kwargs):
+    # Runs inside sglang-d's scheduler grandchild (spawned by launch_server via
+    # mp.Process). Grandchild re-imports modules from scratch under spawn, so
+    # any monkey patches done in the middle child are gone. Apply them HERE,
+    # before calling the real run_scheduler_process, so the DiT that's
+    # constructed inside the grandchild sees the patched classes.
+    from miles.backends.fsdp_utils.models.qwen_image_patch import (
+        apply_qwen_image_diffusers_parity_patches,
+    )
+    apply_qwen_image_diffusers_parity_patches()
+    from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as _RN
+    print(
+        f"[true-onpolicy grandchild] Qwen-Image diffusers-parity patches applied; "
+        f"RMSNorm.forward = {_RN.forward.__qualname__}",
+        flush=True,
+    )
+    from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+    return run_scheduler_process(*args, **kwargs)
+
+
 def _launch_server_target(server_args, apply_qwen_image_patch: bool = False):
     # addict.Dict used by SGL-D loses its `__frozen` instance attribute across spawn pickle.
     # Reconstruct a fresh one from the unpickled (broken) instance
@@ -42,19 +62,17 @@ def _launch_server_target(server_args, apply_qwen_image_patch: bool = False):
         server_args.attention_backend_config = addict.Dict(server_args.attention_backend_config)
 
     if apply_qwen_image_patch:
-        # Must run BEFORE launch_server imports/builds the DiT, otherwise the
-        # monkey patches land on already-constructed layer instances that the
-        # DiT has cached internally.
-        from miles.backends.fsdp_utils.models.qwen_image_patch import (
-            apply_qwen_image_diffusers_parity_patches,
-        )
-        apply_qwen_image_diffusers_parity_patches()
-        # print+verify so users can confirm the patch actually took effect at
-        # class level (logger.info is suppressed by sglang-d's logging setup).
-        from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as _RN
+        # launch_server spawns its scheduler via mp.Process(target=run_scheduler_process).
+        # Under spawn, target is pickled by qualname and re-imported in the grandchild,
+        # so patching in THIS process doesn't help. Instead, rebind the name inside
+        # launch_server's own module to point at our wrapper — pickle then carries
+        # the miles qualname across to the grandchild, which applies the patch before
+        # calling the real scheduler entrypoint.
+        import sglang.multimodal_gen.runtime.launch_server as _ls_mod
+        _ls_mod.run_scheduler_process = _scheduler_process_with_qwen_image_patch
         print(
-            f"[true-onpolicy] Qwen-Image diffusers-parity patches applied; "
-            f"RMSNorm.forward = {_RN.forward.__qualname__}",
+            "[true-onpolicy] rebound launch_server.run_scheduler_process to miles wrapper "
+            "so grandchild scheduler process applies Qwen-Image diffusers-parity patches.",
             flush=True,
         )
 
