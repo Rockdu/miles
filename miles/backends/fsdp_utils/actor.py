@@ -369,18 +369,6 @@ class FSDPTrainRayActor(TrainRayActor):
                         alloc = torch.cuda.memory_allocated() / 1e9
                         reserved = torch.cuda.memory_reserved() / 1e9
                         print(f"[DEBUG] before first forward: allocated={alloc:.2f}GB reserved={reserved:.2f}GB", flush=True)
-                        # Dump DiT input summary so we can see if the forward
-                        # gets the same latent / timestep / cond as rollout.
-                        print(
-                            f"[input align traj=0 chunk_t={t_start}:{t_end}] "
-                            f"lat shape={tuple(lat_chunk.shape)} norm={lat_chunk.float().norm().item():.3f} "
-                            f"ts={ts_chunk.tolist()} "
-                            f"enc_hid shape={tuple(pos_batch.get('encoder_hidden_states', torch.empty(0)).shape)} "
-                            f"enc_hid norm={pos_batch['encoder_hidden_states'].float().norm().item():.3f} "
-                            f"txt_seq_lens={pos_batch.get('txt_seq_lens')} "
-                            f"img_shapes={pos_batch.get('img_shapes')}",
-                            flush=True,
-                        )
 
                     # Match rollout's compute dtype exactly. Rollout runs under
                     # torch.autocast("cuda", <dtype>) so all inputs enter the DiT
@@ -396,15 +384,6 @@ class FSDPTrainRayActor(TrainRayActor):
                         return_dict=False,
                         **_cast(pos_batch),
                     )[0]
-                    if t_start == 0 and i == traj_start:
-                        print(
-                            f"[noise_pred_pos traj=0 chunk_t={t_start}:{t_end}] "
-                            f"shape={tuple(noise_pred_pos.shape)} "
-                            f"norm={noise_pred_pos.float().norm().item():.3f} "
-                            f"mean={noise_pred_pos.float().mean().item():.4f} "
-                            f"std={noise_pred_pos.float().std().item():.4f}",
-                            flush=True,
-                        )
 
                     if t_start == 0 and i == traj_start:
                         alloc = torch.cuda.memory_allocated() / 1e9
@@ -437,6 +416,15 @@ class FSDPTrainRayActor(TrainRayActor):
                         rdt = rollout_debug_list[i]
                         if rdt is not None and rdt.rollout_model_outputs is not None:
                             ro_mo = rdt.rollout_model_outputs.to(device).float()
+                            # Match training's sde-window slicing: training slices
+                            # latents/next_latents/timesteps with ``sde_idx`` above so
+                            # noise_pred corresponds to trajectory steps
+                            # ``sde_idx[t_start:t_end]`` — compare ro_mo against the
+                            # same trajectory steps, not ``ro_mo[t_start:t_end]``.
+                            if sde_idx is not None:
+                                ro_mo_sliced = ro_mo[idx]
+                            else:
+                                ro_mo_sliced = ro_mo
                             if t_start == 0:
                                 print(
                                     f"[rollout_model_outputs] full shape={tuple(ro_mo.shape)} "
@@ -445,7 +433,7 @@ class FSDPTrainRayActor(TrainRayActor):
                                 )
                             # Expected shape: (T, C, H, W) or (T, N, C) per trajectory.
                             # Slice to the current chunk's timesteps.
-                            ro_chunk = ro_mo[t_start:t_end].to(noise_pred.dtype)
+                            ro_chunk = ro_mo_sliced[t_start:t_end].to(noise_pred.dtype)
                             if ro_chunk.shape == noise_pred.shape:
                                 diff = (noise_pred - ro_chunk).abs()
                                 print(
