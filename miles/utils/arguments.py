@@ -352,6 +352,18 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Set rollout_log_prob_no_const=true on POST /rollout/generate.",
             )
             parser.add_argument(
+                "--diffusion-true-onpolicy",
+                action="store_true",
+                default=False,
+                help=(
+                    "Apply miles.backends.fsdp_utils.models.qwen_image_patch at sglang-d "
+                    "startup so its Qwen-Image DiT forward is bit-exact with diffusers' "
+                    "implementation. Makes rollout (sglang-d path) and training-side log-prob "
+                    "agree on noise_pred down to bf16 ULPs instead of ~1e-3 — making PPO "
+                    "ratio truly on-policy. ~small perf hit on the rollout engine."
+                ),
+            )
+            parser.add_argument(
                 "--diffusion-debug-mode",
                 action="store_true",
                 default=False,

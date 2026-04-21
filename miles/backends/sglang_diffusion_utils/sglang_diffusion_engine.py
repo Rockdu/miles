@@ -33,7 +33,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def _launch_server_target(server_args):
+def _launch_server_target(server_args, apply_qwen_image_patch: bool = False):
     # addict.Dict used by SGL-D loses its `__frozen` instance attribute across spawn pickle.
     # Reconstruct a fresh one from the unpickled (broken) instance
     import addict
@@ -41,15 +41,38 @@ def _launch_server_target(server_args):
     if server_args.attention_backend_config is not None:
         server_args.attention_backend_config = addict.Dict(server_args.attention_backend_config)
 
+    if apply_qwen_image_patch:
+        # Must run BEFORE launch_server imports/builds the DiT, otherwise the
+        # monkey patches land on already-constructed layer instances that the
+        # DiT has cached internally.
+        from miles.backends.fsdp_utils.models.qwen_image_patch import (
+            apply_qwen_image_diffusers_parity_patches,
+        )
+        apply_qwen_image_diffusers_parity_patches()
+        # print+verify so users can confirm the patch actually took effect at
+        # class level (logger.info is suppressed by sglang-d's logging setup).
+        from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as _RN
+        print(
+            f"[true-onpolicy] Qwen-Image diffusers-parity patches applied; "
+            f"RMSNorm.forward = {_RN.forward.__qualname__}",
+            flush=True,
+        )
+
     from sglang.multimodal_gen.runtime.launch_server import launch_server
     launch_server(server_args)
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(
+    server_args: ServerArgs,
+    apply_qwen_image_patch: bool = False,
+) -> multiprocessing.Process:
     # use spawn to avoid potential risks of fork in terms of subthreads or CUDA.
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=_launch_server_target, args=(server_args,))
+    p = multiprocessing.Process(
+        target=_launch_server_target,
+        args=(server_args, apply_qwen_image_patch),
+    )
     p.start()
 
     _wait_server_healthy(
@@ -144,7 +167,16 @@ class SGLangDiffusionEngine(RayActor):
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         self._pin_to_assigned_gpu()
-        self.process = launch_server_process(ServerArgs.from_kwargs(**server_args_dict))
+        apply_patch = bool(getattr(self.args, "diffusion_true_onpolicy", False))
+        if apply_patch:
+            logger.info(
+                "Launching sglang-d with Qwen-Image diffusers-parity patches "
+                "(--diffusion-true-onpolicy)"
+            )
+        self.process = launch_server_process(
+            ServerArgs.from_kwargs(**server_args_dict),
+            apply_qwen_image_patch=apply_patch,
+        )
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if self.args.use_miles_router:
