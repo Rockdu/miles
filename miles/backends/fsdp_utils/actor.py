@@ -29,6 +29,56 @@ from .diffusion_update_weight_utils import DiffusionUpdateWeightFromTensor, Diff
 logger = logging.getLogger(__name__)
 
 
+def _rebuild_pos_embed_freqs_on_cuda(model) -> None:
+    """Rebuild QwenEmbedRope ``pos_freqs`` / ``neg_freqs`` on the model's
+    CUDA device so train-side (diffusers) matches rollout-side (sglang-d)
+    bit-exactly.
+
+    diffusers' ``QwenEmbedRope.__init__`` builds these caches on CPU
+    (``torch.arange(4096)`` with no ``device=``), and its ``forward``
+    only ``.to(device)``s them — values stay CPU-computed.  sglang-d
+    meta-inits and its forward rebuilds on CUDA.  CPU vs CUDA
+    ``torch.pow`` differ by fp32 ULPs, so the two caches byte-differ →
+    RoPE output differs → every block's output drifts → frozen-weight
+    ``noise_pred`` mean|Δ| ~2e-02.
+    """
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return
+    if device.type != "cuda":
+        return
+    for submod in model.modules():
+        if not (
+            hasattr(submod, "pos_freqs")
+            and hasattr(submod, "neg_freqs")
+            and hasattr(submod, "axes_dim")
+            and hasattr(submod, "theta")
+        ):
+            continue
+        theta = submod.theta
+
+        def _params(index: torch.Tensor, dim: int) -> torch.Tensor:
+            inv = 1.0 / torch.pow(
+                theta,
+                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+            )
+            freqs = torch.outer(index, inv)
+            return torch.polar(torch.ones_like(freqs), freqs)
+
+        pos_idx = torch.arange(4096, device=device)
+        neg_idx = torch.arange(4096, device=device).flip(0) * -1 - 1
+        submod.pos_freqs = torch.cat(
+            [_params(pos_idx, d) for d in submod.axes_dim], dim=1
+        )
+        submod.neg_freqs = torch.cat(
+            [_params(neg_idx, d) for d in submod.axes_dim], dim=1
+        )
+        cvf = getattr(submod, "_compute_video_freqs", None)
+        if cvf is not None and hasattr(cvf, "cache_clear"):
+            cvf.cache_clear()
+
+
 class FSDPTrainRayActor(TrainRayActor):
     """FSDP training actor for diffusion GRPO.
 
@@ -102,6 +152,11 @@ class FSDPTrainRayActor(TrainRayActor):
         # Move to GPU first, then FSDP shard — FSDP2 shards at init time
         # and converts params to DTensor. Must be on GPU for NCCL collectives.
         model.to(torch.cuda.current_device())
+
+        # Rebuild RoPE freq caches on CUDA to bit-match the sglang-d
+        # rollout side (which meta-inits and always rebuilds on CUDA).
+        _rebuild_pos_embed_freqs_on_cuda(model)
+
         model = apply_fsdp2(
             model,
             mesh=self.parallel_state.dp_mesh,
