@@ -40,8 +40,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Align runs need only 2 GPUs (1 train rank + 1 rollout engine, colocated).
 # Bump / change to match your free GPUs.
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=6,7
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export MILES_VERIFY_WEIGHT_SYNC=1
+export MILES_DUMP_LATENT_HASH=1
+export MILES_DUMP_BLOCK_HASH=1
+export MILES_DUMP_INTRA=1
+export MILES_DUMP_ATTN_INTRA=1
 RUN_NAME="diffusion_align_$(date +%Y%m%d_%H%M%S)"
 
 WANDB_ARGS=()
@@ -70,7 +75,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --rollout-batch-size 1 \
   --n-samples-per-prompt 8 \
   --num-rollout 100000 \
-  --diffusion-timestep-batch 10 \
+  --diffusion-timestep-batch 1 \
   --gradient-checkpointing \
   --actor-num-gpus-per-node 2 \
   --rollout-num-gpus 2 \
@@ -99,5 +104,6 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-height 256 \
   --diffusion-width 256 \
   --diffusion-debug-mode \
+  --diffusion-true-onpolicy \
   --debug-skip-optimizer-step \
   "${WANDB_ARGS[@]}"

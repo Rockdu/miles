@@ -29,6 +29,76 @@ from .diffusion_update_weight_utils import DiffusionUpdateWeightFromTensor, Diff
 logger = logging.getLogger(__name__)
 
 
+def _rebuild_pos_embed_freqs_on_cuda(model) -> None:
+    """Rebuild ``QwenEmbedRope.pos_freqs`` / ``neg_freqs`` on CUDA for
+    bit-exact train/rollout RoPE alignment.
+
+    diffusers' ``QwenEmbedRope.__init__`` runs ``torch.arange(4096)`` +
+    ``torch.pow(theta, ...)`` on CPU, and the forward pass only moves the
+    resulting tensors to the target device via ``.to(device)`` — the
+    underlying fp32 bytes stay CPU-computed.  sglang-d's DiT loads under
+    ``init_empty_weights`` (meta) and takes the meta-rebuild branch
+    inside its own ``QwenEmbedRope.forward``, recomputing the same
+    frequencies on CUDA.  CPU and CUDA implementations of ``torch.pow``
+    differ by fp32 ULPs, so the two caches end up byte-different even
+    though they represent the same mathematical values.  That tiny
+    divergence propagates through RoPE → attention → every block and
+    produces an end-to-end ``noise_pred`` drift of 1-3e-02 with frozen
+    weights.
+
+    This function walks the model, finds every ``QwenEmbedRope`` (or
+    similar) module, and rebuilds its freq caches on CUDA using the same
+    formulas but with explicit ``device=`` at every allocation.  Must be
+    called after ``model.to(cuda)`` and before FSDP sharding.
+    """
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return
+    if device.type != "cuda":
+        return
+
+    for submod in model.modules():
+        # Match by attribute shape rather than class name so we also
+        # handle ``QwenEmbedLayer3DRope`` and similar variants.
+        if not (
+            hasattr(submod, "pos_freqs")
+            and hasattr(submod, "neg_freqs")
+            and hasattr(submod, "rope_params")
+            and hasattr(submod, "axes_dim")
+            and hasattr(submod, "theta")
+        ):
+            continue
+        theta = submod.theta
+
+        def _rope_params_cuda(index: torch.Tensor, dim: int) -> torch.Tensor:
+            inv_freq = 1.0 / torch.pow(
+                theta,
+                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+            )
+            freqs = torch.outer(index, inv_freq)
+            return torch.polar(torch.ones_like(freqs), freqs)
+
+        pos_idx = torch.arange(4096, device=device)
+        neg_idx = torch.arange(4096, device=device).flip(0) * -1 - 1
+        submod.pos_freqs = torch.cat(
+            [_rope_params_cuda(pos_idx, d) for d in submod.axes_dim], dim=1
+        )
+        submod.neg_freqs = torch.cat(
+            [_rope_params_cuda(neg_idx, d) for d in submod.axes_dim], dim=1
+        )
+        # Clear any LRU cache that may hold CPU-derived freqs.
+        _cvf = getattr(submod, "_compute_video_freqs", None)
+        if _cvf is not None and hasattr(_cvf, "cache_clear"):
+            _cvf.cache_clear()
+        logger.info(
+            "[rope_cuda_rebuild] module=%s axes_dim=%s pos_freqs.device=%s",
+            submod.__class__.__name__,
+            submod.axes_dim,
+            submod.pos_freqs.device,
+        )
+
+
 class FSDPTrainRayActor(TrainRayActor):
     """FSDP training actor for diffusion GRPO.
 
@@ -102,6 +172,23 @@ class FSDPTrainRayActor(TrainRayActor):
         # Move to GPU first, then FSDP shard — FSDP2 shards at init time
         # and converts params to DTensor. Must be on GPU for NCCL collectives.
         model.to(torch.cuda.current_device())
+
+        # BIT-EXACT RoPE FIX: diffusers' ``QwenEmbedRope`` builds
+        # ``pos_freqs`` / ``neg_freqs`` on CPU in ``__init__`` (via
+        # ``torch.arange(4096)`` with no device=), and their ``forward``
+        # only *moves* them to the target device via ``.to(device)``.
+        # The values inside are therefore the CPU-computed result of
+        # ``torch.pow(theta, ...)`` and ``torch.polar(...)``.
+        # sglang-d's DiT loads under ``init_empty_weights`` (meta), so
+        # its forward hits the meta-rebuild branch and recomputes the
+        # frequencies on CUDA.  CPU and CUDA implementations of
+        # ``torch.pow`` differ by fp32 ULPs → the two sides end up with
+        # byte-different RoPE caches → RoPE outputs differ → attention
+        # outputs differ → every block's output drifts → end-to-end
+        # noise_pred mean|Δ| ~1-3e-02 with frozen weights.
+        # Rebuild freqs on CUDA here, before FSDP shards the model, to
+        # match sglang-d exactly.
+        _rebuild_pos_embed_freqs_on_cuda(model)
         model = apply_fsdp2(
             model,
             mesh=self.parallel_state.dp_mesh,
@@ -362,6 +449,15 @@ class FSDPTrainRayActor(TrainRayActor):
                     # inside forward; diffusers' Qwen DiT does NOT — so we must
                     # pre-scale here to land at the same time-embedding input.
                     # Ref: sglang/.../models/dits/qwen_image.py (`timestep = timestep / 1000`).
+                    #
+                    # sgl-d's ``timestep`` entering its DiT is fp32 (see
+                    # ``denoising.py:expand_timestep_before_forward`` → no
+                    # dtype cast, just ``t_device.repeat(bsz)``), so its
+                    # ``(timestep / 1000).to(dtype)`` is effectively
+                    # ``(fp32 / 1000).to(bf16)`` — the same order this line
+                    # uses.  Do NOT pre-cast ``ts_chunk`` to bf16 here;
+                    # that would use bf16 arithmetic and diverge from sgl-d
+                    # by 1 bf16 ULP at most sigmas.
                     ts_chunk_for_model = ts_chunk / float(num_train_timesteps)
 
                     pos_batch = tpc.expand_cond_for_timestep_batch(pos_cond, tb)
@@ -378,12 +474,497 @@ class FSDPTrainRayActor(TrainRayActor):
                     # When diffusion_dtype=fp32, this is a no-op (inputs already fp32).
                     _dt = self._compute_dtype
                     _cast = lambda d: {k: v.to(_dt) if isinstance(v, torch.Tensor) else v for k, v in d.items()}
+
+                    # [latent fingerprint] Print SHA-256 of the exact bf16
+                    # tensor going into training DiT + metadata. Runs once
+                    # per rollout at (i=traj_start, step_id=0, t_start=0).
+                    # Purpose: rule out an fp32→bf16 round-trip artifact on
+                    # miles side, and provide a byte-level fingerprint that
+                    # can be cross-checked against an optional sglang-d
+                    # sha256 print at denoising.py:1149 ``ctx.latents``.
+                    # If the two hashes match, DiT input is byte-equal on
+                    # both sides → the residual ~2e-02 is truly DiT math.
+                    if (
+                        i == traj_start and step_id == 0 and t_start == 0
+                    ):
+                        import hashlib
+                        # .numpy() rejects bf16; view as uint8 to get raw
+                        # bytes regardless of dtype (sha256 cares about
+                        # bytes, not numerics).
+                        _h = lambda t: hashlib.sha256(
+                            t.contiguous().view(torch.uint8).numpy().tobytes()
+                        ).hexdigest()[:16]
+                        # Print per-timestep hashes (one row per DiT call)
+                        # so we can match against sglang-d's per-step_index
+                        # sha print (in denoising.py with MILES_DUMP_LATENT_HASH).
+                        # ``sde_idx`` gives the absolute trajectory step
+                        # indices for this batch, so the k-th row
+                        # corresponds to sglang's step_index=sde_idx[k].
+                        _lc_bf16 = lat_chunk.to(_dt).detach().contiguous().cpu()
+                        _sde_idx_list = (
+                            sde_idx.tolist() if hasattr(sde_idx, "tolist")
+                            else (list(sde_idx) if sde_idx is not None else None)
+                        )
+                        # Latent per-row
+                        for _k in range(_lc_bf16.shape[0]):
+                            _row = _lc_bf16[_k]
+                            _abs_step = (
+                                _sde_idx_list[t_start + _k]
+                                if _sde_idx_list is not None else t_start + _k
+                            )
+                            print(
+                                f"[latent fingerprint i={i} chunk_row={_k} "
+                                f"sglang_step_index={_abs_step}] "
+                                f"sha_bf16={_h(_row)} "
+                                f"dtype={_row.dtype} shape={tuple(_row.shape)} "
+                                f"contig={_row.is_contiguous()} stride={_row.stride()} "
+                                f"norm={_row.float().norm().item():.6f}",
+                                flush=True,
+                            )
+                        # Timestep: miles pre-scales by /num_train_timesteps
+                        # in fp32, then .to(bf16). sglang's DiT does the
+                        # divide internally in bf16. If the two paths don't
+                        # produce bit-equal post-scale bf16 timesteps, that's
+                        # a real residual source.
+                        try:
+                            _ts_raw = ts_chunk.detach().cpu()
+                            _ts_fed = ts_chunk_for_model.to(_dt).detach().cpu()
+                            # sglang-actual path: fp32_ts / 1000 then cast
+                            # to bf16 (matches denoising.py line 1182 +
+                            # qwen_image.py line 1229 where ``timestep``
+                            # entering the DiT is fp32 from the scheduler,
+                            # divided in fp32, then cast to target dtype).
+                            _ts_sglang_actual = (
+                                (ts_chunk / 1000.0).to(torch.bfloat16)
+                            ).detach().cpu()
+                            # Hypothetical bf16-first path for contrast:
+                            # cast ts→bf16 first, divide in bf16.
+                            _ts_bf16_path = (
+                                (ts_chunk.to(torch.bfloat16) / 1000.0)
+                                .to(torch.bfloat16).detach().cpu()
+                            )
+                            for _k in range(_ts_raw.shape[0]):
+                                _abs_step = (
+                                    _sde_idx_list[t_start + _k]
+                                    if _sde_idx_list is not None else t_start + _k
+                                )
+                                print(
+                                    f"[ts fingerprint i={i} chunk_row={_k} "
+                                    f"sglang_step_index={_abs_step}] "
+                                    f"raw_val={_ts_raw[_k].item():.6f} "
+                                    f"miles_fed_sha={_h(_ts_fed[_k:_k+1])} "
+                                    f"miles_fed_val={_ts_fed[_k].float().item():.8f} "
+                                    f"sglang_actual_sha={_h(_ts_sglang_actual[_k:_k+1])} "
+                                    f"sglang_actual_val={_ts_sglang_actual[_k].float().item():.8f} "
+                                    f"bf16_path_sha={_h(_ts_bf16_path[_k:_k+1])} "
+                                    f"bf16_path_val={_ts_bf16_path[_k].float().item():.8f} "
+                                    f"miles==sglang_actual: {torch.equal(_ts_fed[_k:_k+1], _ts_sglang_actual[_k:_k+1])}",
+                                    flush=True,
+                                )
+                        except Exception as _e:
+                            print(f"[ts fingerprint] failed: {_e}", flush=True)
+                        # Encoder hidden states + mask (from pos_batch).
+                        try:
+                            _p = _cast(pos_batch)
+                            _ehs = _p.get("encoder_hidden_states")
+                            _mask = _p.get("encoder_hidden_states_mask")
+                            _img_shapes = _p.get("img_shapes")
+                            _txt_seq_lens = _p.get("txt_seq_lens")
+                            def _h_flat(t):
+                                # Flatten+contiguous so 0-d and non-contig
+                                # are handled; then view as bytes.
+                                b = t.detach().contiguous().cpu().flatten()
+                                if b.numel() == 0:
+                                    return "empty"
+                                return hashlib.sha256(
+                                    b.view(torch.uint8).numpy().tobytes()
+                                ).hexdigest()[:16]
+                            def _fmt(x):
+                                if isinstance(x, torch.Tensor):
+                                    return (
+                                        f"sha={_h_flat(x)} dtype={x.dtype} "
+                                        f"shape={tuple(x.shape)} "
+                                        f"norm={x.float().norm().item():.6f}"
+                                    )
+                                if isinstance(x, list):
+                                    parts = []
+                                    for _j, _e in enumerate(x):
+                                        if isinstance(_e, torch.Tensor):
+                                            parts.append(
+                                                f"[{_j}] sha={_h_flat(_e)} "
+                                                f"dtype={_e.dtype} shape={tuple(_e.shape)} "
+                                                f"norm={_e.float().norm().item():.6f}"
+                                            )
+                                        else:
+                                            parts.append(f"[{_j}] type={type(_e).__name__}")
+                                    return "list(" + " ; ".join(parts) + ")"
+                                return f"type={type(x).__name__}"
+                            print(
+                                f"[miles pos_cond i={i}] "
+                                f"ehs={_fmt(_ehs)} | "
+                                f"mask={_fmt(_mask)} | "
+                                f"img_shapes={_img_shapes} "
+                                f"txt_seq_lens={_txt_seq_lens}",
+                                flush=True,
+                            )
+                        except Exception as _e:
+                            print(f"[miles pos_cond] failed: {_e}", flush=True)
+
+                    # (pos_embed freqs were rebuilt on CUDA at model
+                    # load time in ``FSDPTrainRayActor.init`` via
+                    # ``_rebuild_pos_embed_freqs_on_cuda`` — that's the
+                    # bit-exact RoPE fix that makes train/rollout
+                    # noise_pred align to 0.0 mean|Δ|.)
+
+                    # Register forward hooks to dump hidden_states hash
+                    # after pre-block ops (img_in, txt_norm, txt_in,
+                    # time_text_embed) and after each transformer block,
+                    # on the FIRST forward only. Hooks unregister
+                    # themselves after the forward. Also install an
+                    # intra-block hash hook on block 0 to find the first
+                    # sub-op where miles/sglang diverge.
+                    _block_hooks = []
+                    _intra_installed_block0 = None
+                    _orig_blk0_forward_ref = None
+                    if (
+                        i == traj_start and step_id == 0 and t_start == 0
+                    ):
+                        # Install intra-block hash via monkey-patching
+                        # block 0's forward method. Matches sglang's
+                        # qwen_image.py intra-print stages.
+                        import os as _os_intra_m
+                        _blocks_ref = getattr(self.model, "transformer_blocks", None)
+                        if (
+                            _blocks_ref is not None and len(_blocks_ref) > 0
+                            and _os_intra_m.environ.get("MILES_DUMP_INTRA")
+                            in ("1", "true", "True")
+                        ):
+                            import hashlib as _hashlib_mintra
+                            def _mih(t):
+                                if not isinstance(t, torch.Tensor):
+                                    return f"type={type(t).__name__}"
+                                b = t.detach().contiguous().cpu().flatten()
+                                if b.numel() == 0:
+                                    return "empty"
+                                return _hashlib_mintra.sha256(
+                                    b.view(torch.uint8).numpy().tobytes()
+                                ).hexdigest()[:16]
+                            _blk0 = _blocks_ref[0]
+                            _orig_blk0_forward_ref = _blk0.forward
+                            def _mifmt(tag, t, _ctr):
+                                if isinstance(t, torch.Tensor):
+                                    print(
+                                        f"[miles intra blk0 call{_ctr}] {tag} "
+                                        f"sha={_mih(t)} dtype={t.dtype} "
+                                        f"shape={tuple(t.shape)} "
+                                        f"norm={t.float().norm().item():.6f}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"[miles intra blk0 call{_ctr}] {tag} "
+                                        f"type={type(t).__name__}",
+                                        flush=True,
+                                    )
+                            _blk0_call_ctr = [0]
+                            def _patched_blk0_forward(
+                                hidden_states,
+                                encoder_hidden_states,
+                                encoder_hidden_states_mask,
+                                temb,
+                                image_rotary_emb=None,
+                                joint_attention_kwargs=None,
+                                modulate_index=None,
+                            ):
+                                _c = _blk0_call_ctr[0]
+                                _blk0_call_ctr[0] += 1
+                                if _c >= 4:
+                                    return _orig_blk0_forward_ref(
+                                        hidden_states=hidden_states,
+                                        encoder_hidden_states=encoder_hidden_states,
+                                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                                        temb=temb,
+                                        image_rotary_emb=image_rotary_emb,
+                                        joint_attention_kwargs=joint_attention_kwargs,
+                                        modulate_index=modulate_index,
+                                    )
+                                self_blk = _blk0
+                                _mifmt("enter_hs", hidden_states, _c)
+                                _mifmt("enter_ehs", encoder_hidden_states, _c)
+                                _mifmt("temb", temb, _c)
+                                # Replicate block forward with hash points:
+                                img_mod_params = self_blk.img_mod(temb)
+                                temb_for_txt = temb
+                                if getattr(self_blk, "zero_cond_t", False):
+                                    temb_for_txt = torch.chunk(temb, 2, dim=0)[0]
+                                txt_mod_params = self_blk.txt_mod(temb_for_txt)
+                                _mifmt("img_mod_params", img_mod_params, _c)
+                                _mifmt("txt_mod_params", txt_mod_params, _c)
+                                img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+                                txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+                                img_normed = self_blk.img_norm1(hidden_states)
+                                img_modulated, img_gate1 = self_blk._modulate(
+                                    img_normed, img_mod1, modulate_index,
+                                )
+                                _mifmt("img_modulated (post_img_norm1)", img_modulated, _c)
+                                _mifmt("img_gate1", img_gate1, _c)
+                                txt_normed = self_blk.txt_norm1(encoder_hidden_states)
+                                txt_modulated, txt_gate1 = self_blk._modulate(
+                                    txt_normed, txt_mod1,
+                                )
+                                _mifmt("txt_modulated (post_txt_norm1)", txt_modulated, _c)
+                                joint_attention_kwargs = joint_attention_kwargs or {}
+                                attn_output = self_blk.attn(
+                                    hidden_states=img_modulated,
+                                    encoder_hidden_states=txt_modulated,
+                                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                                    image_rotary_emb=image_rotary_emb,
+                                    **joint_attention_kwargs,
+                                )
+                                img_attn_output, txt_attn_output = attn_output
+                                _mifmt("img_attn_output (post_attn)", img_attn_output, _c)
+                                _mifmt("txt_attn_output (post_attn)", txt_attn_output, _c)
+                                hidden_states = hidden_states + img_gate1 * img_attn_output
+                                encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+                                _mifmt("hs_post_residual", hidden_states, _c)
+                                img_normed2 = self_blk.img_norm2(hidden_states)
+                                img_modulated2, img_gate2 = self_blk._modulate(
+                                    img_normed2, img_mod2, modulate_index,
+                                )
+                                _mifmt("img_modulated2 (post_img_norm2+residual)", img_modulated2, _c)
+                                img_mlp_output = self_blk.img_mlp(img_modulated2)
+                                _mifmt("img_mlp_output", img_mlp_output, _c)
+                                hidden_states = hidden_states + img_gate2 * img_mlp_output
+                                _mifmt("hs_post_img_mlp_add", hidden_states, _c)
+                                txt_normed2 = self_blk.txt_norm2(encoder_hidden_states)
+                                txt_modulated2, txt_gate2 = self_blk._modulate(
+                                    txt_normed2, txt_mod2,
+                                )
+                                txt_mlp_output = self_blk.txt_mlp(txt_modulated2)
+                                encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+                                if encoder_hidden_states.dtype == torch.float16:
+                                    encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+                                if hidden_states.dtype == torch.float16:
+                                    hidden_states = hidden_states.clip(-65504, 65504)
+                                return encoder_hidden_states, hidden_states
+                            _blk0.forward = _patched_blk0_forward
+                            _intra_installed_block0 = _blk0
+
+                            # Also monkey-patch block 0 attention forward
+                            # to hash QKV linear outputs, qk_norm, RoPE,
+                            # SDPA inputs/output, to_out — pinpoint first
+                            # divergent sub-op.
+                            _attn0 = _blk0.attn
+                            _orig_attn0_forward_ref = _attn0.forward
+                            _attn0_call_ctr = [0]
+                            from diffusers.models.transformers.transformer_qwenimage import (
+                                apply_rotary_emb_qwen as _apply_rotary_qwen,
+                            )
+                            import torch.nn.functional as _F
+                            def _mafmt(tag, t, _c):
+                                if isinstance(t, torch.Tensor):
+                                    print(
+                                        f"[miles attn blk0 call{_c}] {tag} "
+                                        f"sha={_mih(t)} dtype={t.dtype} "
+                                        f"shape={tuple(t.shape)} "
+                                        f"norm={t.float().norm().item():.6f}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        f"[miles attn blk0 call{_c}] {tag} "
+                                        f"type={type(t).__name__}",
+                                        flush=True,
+                                    )
+                            def _patched_attn0_forward(
+                                hidden_states,
+                                encoder_hidden_states=None,
+                                encoder_hidden_states_mask=None,
+                                attention_mask=None,
+                                image_rotary_emb=None,
+                                **kwargs,
+                            ):
+                                _c = _attn0_call_ctr[0]
+                                _attn0_call_ctr[0] += 1
+                                if _c >= 4:
+                                    return _orig_attn0_forward_ref(
+                                        hidden_states=hidden_states,
+                                        encoder_hidden_states=encoder_hidden_states,
+                                        encoder_hidden_states_mask=encoder_hidden_states_mask,
+                                        attention_mask=attention_mask,
+                                        image_rotary_emb=image_rotary_emb,
+                                        **kwargs,
+                                    )
+                                attn = _attn0
+                                seq_txt = encoder_hidden_states.shape[1]
+                                _mafmt("enter_hs", hidden_states, _c)
+                                _mafmt("enter_ehs", encoder_hidden_states, _c)
+                                img_query = attn.to_q(hidden_states)
+                                img_key = attn.to_k(hidden_states)
+                                img_value = attn.to_v(hidden_states)
+                                txt_query = attn.add_q_proj(encoder_hidden_states)
+                                txt_key = attn.add_k_proj(encoder_hidden_states)
+                                txt_value = attn.add_v_proj(encoder_hidden_states)
+                                _mafmt("img_q_post_linear", img_query, _c)
+                                _mafmt("img_k_post_linear", img_key, _c)
+                                _mafmt("img_v_post_linear", img_value, _c)
+                                _mafmt("txt_q_post_linear", txt_query, _c)
+                                _mafmt("txt_k_post_linear", txt_key, _c)
+                                _mafmt("txt_v_post_linear", txt_value, _c)
+                                img_query = img_query.unflatten(-1, (attn.heads, -1))
+                                img_key = img_key.unflatten(-1, (attn.heads, -1))
+                                img_value = img_value.unflatten(-1, (attn.heads, -1))
+                                txt_query = txt_query.unflatten(-1, (attn.heads, -1))
+                                txt_key = txt_key.unflatten(-1, (attn.heads, -1))
+                                txt_value = txt_value.unflatten(-1, (attn.heads, -1))
+                                _mafmt("img_q_post_unflatten", img_query, _c)
+                                _mafmt("img_k_post_unflatten", img_key, _c)
+                                _mafmt("txt_q_post_unflatten", txt_query, _c)
+                                _mafmt("txt_k_post_unflatten", txt_key, _c)
+                                if attn.norm_q is not None:
+                                    img_query = attn.norm_q(img_query)
+                                if attn.norm_k is not None:
+                                    img_key = attn.norm_k(img_key)
+                                if attn.norm_added_q is not None:
+                                    txt_query = attn.norm_added_q(txt_query)
+                                if attn.norm_added_k is not None:
+                                    txt_key = attn.norm_added_k(txt_key)
+                                _mafmt("img_q_post_qknorm_only", img_query, _c)
+                                _mafmt("img_k_post_qknorm_only", img_key, _c)
+                                _mafmt("txt_q_post_qknorm_only", txt_query, _c)
+                                _mafmt("txt_k_post_qknorm_only", txt_key, _c)
+                                if image_rotary_emb is not None:
+                                    img_freqs, txt_freqs = image_rotary_emb
+                                    _mafmt("img_freqs_complex", img_freqs, _c)
+                                    _mafmt("txt_freqs_complex", txt_freqs, _c)
+                                    # Also dump real [cos|sin] form so we
+                                    # can compare to sglang's cos_sin_cache.
+                                    if isinstance(img_freqs, torch.Tensor) and img_freqs.is_complex():
+                                        _ifr = torch.cat([img_freqs.real, img_freqs.imag], dim=-1).contiguous()
+                                        _mafmt("img_freqs_real(cos|sin)", _ifr, _c)
+                                    if isinstance(txt_freqs, torch.Tensor) and txt_freqs.is_complex():
+                                        _tfr = torch.cat([txt_freqs.real, txt_freqs.imag], dim=-1).contiguous()
+                                        _mafmt("txt_freqs_real(cos|sin)", _tfr, _c)
+                                    img_query = _apply_rotary_qwen(img_query, img_freqs, use_real=False)
+                                    img_key = _apply_rotary_qwen(img_key, img_freqs, use_real=False)
+                                    txt_query = _apply_rotary_qwen(txt_query, txt_freqs, use_real=False)
+                                    txt_key = _apply_rotary_qwen(txt_key, txt_freqs, use_real=False)
+                                _mafmt("img_q_post_qknorm_rope", img_query, _c)
+                                _mafmt("img_k_post_qknorm_rope", img_key, _c)
+                                _mafmt("txt_q_post_qknorm_rope", txt_query, _c)
+                                _mafmt("txt_k_post_qknorm_rope", txt_key, _c)
+                                joint_query = torch.cat([txt_query, img_query], dim=1)
+                                joint_key = torch.cat([txt_key, img_key], dim=1)
+                                joint_value = torch.cat([txt_value, img_value], dim=1)
+                                _mafmt("joint_q", joint_query, _c)
+                                _mafmt("joint_k", joint_key, _c)
+                                _mafmt("joint_v", joint_value, _c)
+                                # SDPA — diffusers dispatches via
+                                # dispatch_attention_fn. Replicate its most
+                                # common path: F.scaled_dot_product_attention
+                                # with q/k/v transposed to [B, H, S, D].
+                                jq = joint_query.transpose(1, 2)
+                                jk = joint_key.transpose(1, 2)
+                                jv = joint_value.transpose(1, 2)
+                                joint_hidden_states = _F.scaled_dot_product_attention(
+                                    jq, jk, jv,
+                                    attn_mask=attention_mask,
+                                    dropout_p=0.0,
+                                    is_causal=False,
+                                ).transpose(1, 2)
+                                _mafmt("post_sdpa", joint_hidden_states, _c)
+                                joint_hidden_states = joint_hidden_states.flatten(2, 3)
+                                joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
+                                _mafmt("post_flatten", joint_hidden_states, _c)
+                                txt_attn_output = joint_hidden_states[:, :seq_txt, :]
+                                img_attn_output = joint_hidden_states[:, seq_txt:, :]
+                                _mafmt("txt_split", txt_attn_output, _c)
+                                _mafmt("img_split", img_attn_output, _c)
+                                img_attn_output = attn.to_out[0](img_attn_output.contiguous())
+                                if len(attn.to_out) > 1:
+                                    img_attn_output = attn.to_out[1](img_attn_output)
+                                _mafmt("img_post_to_out", img_attn_output, _c)
+                                txt_attn_output = attn.to_add_out(txt_attn_output.contiguous())
+                                _mafmt("txt_post_to_add_out", txt_attn_output, _c)
+                                return img_attn_output, txt_attn_output
+                            _attn0.forward = _patched_attn0_forward
+                        import hashlib as _hashlib_blk
+                        def _blk_sha(t):
+                            if not isinstance(t, torch.Tensor):
+                                return f"type={type(t).__name__}"
+                            b = t.detach().contiguous().cpu().flatten()
+                            if b.numel() == 0:
+                                return "empty"
+                            return _hashlib_blk.sha256(
+                                b.view(torch.uint8).numpy().tobytes()
+                            ).hexdigest()[:16]
+                        # Pre-block hooks: single tensor output, not tuple.
+                        def _make_single_hook(_tag):
+                            def _hook(_mod, _inputs, _outputs):
+                                try:
+                                    t = _outputs
+                                    if isinstance(t, tuple):
+                                        t = t[0]
+                                    if isinstance(t, torch.Tensor):
+                                        print(
+                                            f"[miles preblk] stage={_tag} "
+                                            f"sha={_blk_sha(t)} "
+                                            f"dtype={t.dtype} "
+                                            f"shape={tuple(t.shape)} "
+                                            f"norm={t.float().norm().item():.6f}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        print(
+                                            f"[miles preblk] stage={_tag} "
+                                            f"type={type(t).__name__}",
+                                            flush=True,
+                                        )
+                                except Exception as _ee:
+                                    print(f"[miles preblk {_tag}] hook failed: {_ee}", flush=True)
+                            return _hook
+                        def _make_blk_hook(_idx):
+                            def _hook(_mod, _inputs, _outputs):
+                                try:
+                                    ehs, hs = _outputs
+                                    print(
+                                        f"[miles block {_idx:02d}] "
+                                        f"hs_sha={_blk_sha(hs)} hs_norm={hs.float().norm().item():.6f} "
+                                        f"ehs_sha={_blk_sha(ehs)} ehs_norm={ehs.float().norm().item():.6f}",
+                                        flush=True,
+                                    )
+                                except Exception as _ee:
+                                    print(f"[miles block {_idx}] hook failed: {_ee}", flush=True)
+                            return _hook
+                        # Hook pre-block submodules by name.
+                        for _attr_name in ["img_in", "txt_norm", "txt_in", "time_text_embed"]:
+                            _sub = getattr(self.model, _attr_name, None)
+                            if _sub is not None:
+                                _h = _sub.register_forward_hook(
+                                    _make_single_hook(f"post_{_attr_name}")
+                                )
+                                _block_hooks.append(_h)
+                        _blocks_attr = getattr(self.model, "transformer_blocks", None)
+                        if _blocks_attr is not None:
+                            for _bi, _blk in enumerate(_blocks_attr):
+                                _h = _blk.register_forward_hook(_make_blk_hook(_bi))
+                                _block_hooks.append(_h)
+
                     noise_pred_pos = self.model(
                         hidden_states=lat_chunk.to(_dt),
                         timestep=ts_chunk_for_model.to(_dt),
                         return_dict=False,
                         **_cast(pos_batch),
                     )[0]
+
+                    for _h in _block_hooks:
+                        _h.remove()
+                    if _intra_installed_block0 is not None and _orig_blk0_forward_ref is not None:
+                        _intra_installed_block0.forward = _orig_blk0_forward_ref
+                        _attn0_ref = getattr(_intra_installed_block0, "attn", None)
+                        _orig_attn_ref = locals().get("_orig_attn0_forward_ref")
+                        if _attn0_ref is not None and _orig_attn_ref is not None:
+                            _attn0_ref.forward = _orig_attn_ref
 
                     if t_start == 0 and i == traj_start:
                         alloc = torch.cuda.memory_allocated() / 1e9
