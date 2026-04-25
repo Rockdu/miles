@@ -49,9 +49,14 @@ def _rebuild_pos_embed_freqs_on_cuda(model) -> None:
     if device.type != "cuda":
         return
     for submod in model.modules():
+        # Match by attribute shape rather than class name so we also
+        # handle ``QwenEmbedLayer3DRope`` and similar variants — checking
+        # for ``rope_params`` rules out unrelated modules that happen to
+        # have a ``theta`` attribute.
         if not (
             hasattr(submod, "pos_freqs")
             and hasattr(submod, "neg_freqs")
+            and hasattr(submod, "rope_params")
             and hasattr(submod, "axes_dim")
             and hasattr(submod, "theta")
         ):
@@ -77,6 +82,14 @@ def _rebuild_pos_embed_freqs_on_cuda(model) -> None:
         cvf = getattr(submod, "_compute_video_freqs", None)
         if cvf is not None and hasattr(cvf, "cache_clear"):
             cvf.cache_clear()
+        # Log so it's visible in formal-training logs that the rebuild ran;
+        # otherwise the function silently no-ops if the predicate misses.
+        logger.info(
+            "[rope_cuda_rebuild] module=%s axes_dim=%s pos_freqs.device=%s",
+            submod.__class__.__name__,
+            submod.axes_dim,
+            submod.pos_freqs.device,
+        )
 
 
 class FSDPTrainRayActor(TrainRayActor):
@@ -524,7 +537,7 @@ class FSDPTrainRayActor(TrainRayActor):
                     )
                     loss = torch.mean(torch.maximum(unclipped, clipped))
                     if not getattr(self.args, "debug_skip_optimizer_step", False):
-                        loss.backward()
+                        (loss / trajectories_per_step / (sample_train_steps // timestep_batch)).backward()
 
                     with torch.no_grad():
                         per_elem = torch.maximum(unclipped, clipped)
@@ -614,7 +627,14 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None):
 
     diffusion_dtype = getattr(args, "diffusion_dtype", None) if args is not None else None
     param_dtype = _resolve_compute_dtype(diffusion_dtype)
-    reduce_dtype = torch.float32
+    # Env-gated bf16 grad-reduce for direct apples-to-apples comparison with
+    # flow_grpo's FSDP1 default (`MixedPrecision(reduce_dtype=bf16)`). When
+    # MILES_FSDP_REDUCE_BF16=1, miles' default fp32 reduce is downgraded.
+    if os.environ.get("MILES_FSDP_REDUCE_BF16", "").lower() in ("1", "true", "yes"):
+        reduce_dtype = param_dtype
+        logger.info("MILES_FSDP_REDUCE_BF16 set — using bf16 grad reduce (matches flow_grpo)")
+    else:
+        reduce_dtype = torch.float32
 
     logger.info(f"FSDP: wrapping {len(modules)} modules of type {layer_cls_to_wrap}, param_dtype={param_dtype}, reduce_dtype={reduce_dtype}")
 

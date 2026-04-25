@@ -86,6 +86,7 @@ def _parse_dit_trajectory(
     return DiTTrajectory(
         latents=deserialize_func(data.get("latents")),
         timesteps=deserialize_func(data.get("timesteps")),
+        sigmas=deserialize_func(data.get("sigmas")),
     )
 
 
