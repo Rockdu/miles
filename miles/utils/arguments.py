@@ -1433,6 +1433,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Hugging Face model path for PickScore. Required when --rm-type pickscore.",
             )
             parser.add_argument(
+                "--hps-version",
+                type=str,
+                default="v2.1",
+                choices=["v2.0", "v2.1"],
+                help="HPS checkpoint version to use when --rm-type hps. v2.1 (default) is trained on a higher-quality preference dataset than v2.0.",
+            )
+            parser.add_argument(
                 "--custom-rm-path",
                 type=str,
                 default=None,

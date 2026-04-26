@@ -42,6 +42,10 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .pickscore import pickscore_rm
 
         return (await pickscore_rm(args, [sample]))[0]
+    elif rm_type == "hps":
+        from .hps import hps_rm
+
+        return (await hps_rm(args, [sample]))[0]
     elif rm_type:
         raise NotImplementedError(f"Rule-based RM for {rm_type} is not implemented.")
     else:
@@ -64,6 +68,10 @@ async def batched_async_rm(
             from .pickscore import pickscore_rm
 
             return await pickscore_rm(args, samples)
+        if all(rm_type == "hps" for rm_type in rm_types):
+            from .hps import hps_rm
+
+            return await hps_rm(args, samples)
 
     tasks = [async_rm(args, sample, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
