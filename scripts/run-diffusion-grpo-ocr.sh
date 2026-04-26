@@ -10,20 +10,20 @@
 # global (pkill python*, ray stop --force) and would kill any concurrent
 # training on other GPUs. Re-enable manually only if no other trainings are
 # running.
-# pkill -9 sgl*
-# sleep 3
-# ray stop --force
-# pkill -9 ray*
-# pkill -9 python*
-# sleep 3
-# pkill -9 ray*
-# pkill -9 python*
-# ps -eo ppid,state,comm --no-headers | awk '$2=="Z" && $1!=1 && $3~/ray|python|sglang/ {print $1}' | sort -u | xargs -r kill -9 2>/dev/null || true
-# sleep 2
+pkill -9 sgl*
+sleep 3
+ray stop --force
+pkill -9 ray*
+pkill -9 python*
+sleep 3
+pkill -9 ray*
+pkill -9 python*
+ps -eo ppid,state,comm --no-headers | awk '$2=="Z" && $1!=1 && $3~/ray|python|sglang/ {print $1}' | sort -u | xargs -r kill -9 2>/dev/null || true
+sleep 2
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export CUDA_VISIBLE_DEVICES=2,3,4,5
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # WandB: enable if WANDB_API_KEY is present.
 RUN_NAME="diffusion_grpo_$(date +%Y%m%d_%H%M%S)"
@@ -48,9 +48,8 @@ python "${ROOT_DIR}/tools/prepare_ocr_jsonl.py"
 #hf-checkpoint can be any text generation model from HuggingFace, used to generate initial prompts for diffusion model.
 python -u "${ROOT_DIR}/train_diffusion.py" \
   --train-backend fsdp \
-  --diffusion-train \
   --rollout-function-path miles.rollout.sglang_diffusion_rollout.generate_rollout \
-  --hf-checkpoint gpt2 \
+  --hf-checkpoint Qwen/Qwen-Image \
   --prompt-data "${ROOT_DIR}/data/ocr/train.jsonl" \
   --input-key input \
   --rollout-batch-size 32 \
@@ -79,6 +78,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --globalize-reward-std \
   --rm-type ocr \
   --diffusion-dtype bf16 \
+  --bf16-reduce \
   --diffusion-num-steps 10 \
   --diffusion-eval-num-steps 50 \
   --num-steps-per-rollout 2 \

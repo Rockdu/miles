@@ -62,9 +62,8 @@ python "${ROOT_DIR}/tools/prepare_ocr_jsonl.py"
 # `log_prob_mean_abs_diff`, `approx_kl`, and `[noise_pred align ...]`.
 python -u "${ROOT_DIR}/train_diffusion.py" \
   --train-backend fsdp \
-  --diffusion-train \
   --rollout-function-path miles.rollout.sglang_diffusion_rollout.generate_rollout \
-  --hf-checkpoint gpt2 \
+  --hf-checkpoint Qwen/Qwen-Image \
   --prompt-data "${ROOT_DIR}/data/ocr/train.jsonl" \
   --input-key input \
   --rollout-batch-size 1 \
@@ -89,6 +88,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --globalize-reward-std \
   --rm-type ocr \
   --diffusion-dtype bf16 \
+  --bf16-reduce \
   --diffusion-num-steps 10 \
   --diffusion-guidance-scale 4.0 \
   --diffusion-true-cfg-scale 4.0 \

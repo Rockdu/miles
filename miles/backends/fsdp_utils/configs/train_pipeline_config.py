@@ -97,3 +97,8 @@ class TrainPipelineConfig(abc.ABC):
         true_cfg_scale: float | None = None,
     ) -> torch.Tensor:
         """Apply classifier-free guidance. Model-specific (e.g. rescale or not)."""
+    
+    @abc.abstractmethod
+    def preprocess_model_before_fsdp(self, model: torch.nn.Module) -> None:
+        """Preprocess the model before FSDP."""
+        pass

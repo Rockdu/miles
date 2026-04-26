@@ -118,12 +118,6 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             # Diffusion GRPO training knobs (used by DiffusionFSDPTrainRayActor).
             parser.add_argument(
-                "--diffusion-train",
-                action="store_true",
-                default=False,
-                help="Use diffusion GRPO training actor instead of text RL.",
-            )
-            parser.add_argument(
                 "--diffusion-timestep-batch",
                 type=int,
                 default=1,
@@ -140,6 +134,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=5.0,
                 help="Max absolute value for advantage clipping in diffusion training.",
+            )
+            parser.add_argument(
+                "--bf16-reduce",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use bfloat16 gradient reduce dtype for FSDP diffusion training. "
+                    "This matches flow_grpo's bf16 MixedPrecision reduce path."
+                ),
             )
             parser.add_argument(
                 "--qkv-format",
@@ -1838,28 +1841,26 @@ def miles_validate_args(args):
         args.eval_function_path = args.rollout_function_path
 
     if args.num_steps_per_rollout is not None:
-        global_batch_size = args.rollout_batch_size * args.n_samples_per_prompt // args.num_steps_per_rollout
-        if args.global_batch_size is not None:
-            assert args.global_batch_size == global_batch_size, (
-                f"global_batch_size {args.global_batch_size} is not equal to "
-                f"rollout_batch_size {args.rollout_batch_size} * n_samples_per_prompt {args.n_samples_per_prompt} "
-                f"// num_steps_per_rollout {args.num_steps_per_rollout}"
+        samples_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt
+        derived_gbs = samples_per_rollout // args.num_steps_per_rollout
+        if args.global_batch_size is not None and args.global_batch_size != derived_gbs:
+            raise ValueError(
+                f"global_batch_size={args.global_batch_size} contradicts "
+                f"rollout_batch_size×n_samples_per_prompt÷num_steps_per_rollout={derived_gbs}; "
+                f"do not pass both."
             )
-        args.global_batch_size = global_batch_size
+        args.global_batch_size = derived_gbs
 
-    # Diffusion path: --num-steps-per-rollout is the authoritative knob (matches
-    # flow_grpo's "N optimizer steps per epoch" semantics). gradient_accum and
-    # global_batch_size are derived from it and dp_size; they are not exposed
-    # as separate CLI flags on purpose so users can't drift them out of sync.
-    if getattr(args, "diffusion_train", False):
-        dp_size = args.actor_num_gpus_per_node * args.actor_num_nodes
-        if args.num_steps_per_rollout is not None:
-            samples_per_rollout = args.rollout_batch_size * args.n_samples_per_prompt
-            args.diffusion_gradient_accumulation_steps = samples_per_rollout // (args.num_steps_per_rollout * dp_size)
-        else:
-            args.diffusion_gradient_accumulation_steps = 1
-        if args.global_batch_size is None:
-            args.global_batch_size = args.diffusion_gradient_accumulation_steps * dp_size
+    dp_size = args.actor_num_gpus_per_node * args.actor_num_nodes
+    if args.global_batch_size is not None:
+        assert args.global_batch_size % dp_size == 0, (
+            f"global_batch_size {args.global_batch_size} is not divisible by dp_size {dp_size}"
+        )
+        args.num_microbatches = args.global_batch_size // dp_size
+    else:
+        # Fallback when num_steps_per_rollout not given: 1 optim step / rollout, 1 microbatch.
+        args.num_microbatches = 1
+        args.global_batch_size = dp_size
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
