@@ -234,9 +234,12 @@ class FSDPTrainRayActor(TrainRayActor):
             reduced["train/step"] = float(step)
             tracking_utils.log(self.args, reduced, step_key="train/step")
             # Stdout mirror so we can spot misalignment / divergence without wandb.
+            # Use scientific notation with 6 significant digits so fp32-level
+            # alignment metrics (log_prob_mean_abs_diff, ratio_abs_minus_1, etc.)
+            # don't get truncated to 0.0000 by a fixed-decimal format.
             print(
                 f"[train step {int(step)}] rollout={rollout_id} "
-                + " ".join(f"{k}={v:.4f}" for k, v in sorted(reduced.items()) if k not in ("epoch", "rollout/step", "train/step")),
+                + " ".join(f"{k}={v:.6e}" for k, v in sorted(reduced.items()) if k not in ("epoch", "rollout/step", "train/step")),
                 flush=True,
             )
         else:
@@ -319,8 +322,27 @@ class FSDPTrainRayActor(TrainRayActor):
         train_num_timesteps = max(1, num_timesteps)
 
         num_microbatches = max(1, int(getattr(self.args, "num_microbatches", 1)))
-        timestep_batch = int(getattr(self.args, "diffusion_timestep_batch", 1))
+        # `--diffusion-timestep-batch` is retained for backward CLI compat but
+        # superseded by sample-dim batching: each DiT forward now processes the
+        # whole microbatch (M samples) at one timestep, mirroring flow_grpo's
+        # `compute_log_prob` which batches in the sample dim and loops timesteps.
         num_steps_per_rollout = (batch_size + num_microbatches - 1) // num_microbatches
+
+        tpc = self.train_pipeline_config
+        _dt = self._compute_dtype
+
+        def _cast_cond(d: dict) -> dict:
+            """Cast floating-point tensors to compute dtype; leave bool masks /
+            lists unchanged. The bool encoder_hidden_states_mask must NOT be
+            cast to bf16 — diffusers reads it as a bool / int mask.
+            """
+            out: dict = {}
+            for k, v in d.items():
+                if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+                    out[k] = v.to(_dt)
+                else:
+                    out[k] = v
+            return out
 
         with timer("actor_train"):
             for step_id in range(num_steps_per_rollout):
@@ -329,17 +351,26 @@ class FSDPTrainRayActor(TrainRayActor):
 
                 traj_start = step_id * num_microbatches
                 traj_end = min(batch_size, traj_start + num_microbatches)
+                M = traj_end - traj_start
 
-                # Inner loop: accumulate gradients over microbatches.
+                # Per-sample preparation collected into lists, then stacked.
+                lat_list: list[torch.Tensor] = []
+                nxt_list: list[torch.Tensor] = []
+                ts_list: list[torch.Tensor] = []
+                lpo_list: list[torch.Tensor] = []
+                adv_list: list[torch.Tensor] = []
+                pos_kw_list: list[dict] = []
+                neg_kw_list: list[dict] = []
+                T_sde: int | None = None
+
                 for i in range(traj_start, traj_end):
-                    tpc = self.train_pipeline_config
                     latents, next_latents, timesteps_i = tpc.prepare_trajectory(dit_trajectories[i], device)
                     env = denoising_envs[i]
-                    pos_cond = tpc.prepare_cond_kwargs(env.pos_cond_kwargs, device)
-                    neg_cond = tpc.prepare_cond_kwargs(env.neg_cond_kwargs, device) if use_cfg else None
+                    pos_kw_list.append(tpc.prepare_cond_kwargs(env.pos_cond_kwargs, device))
+                    if use_cfg:
+                        neg_kw_list.append(tpc.prepare_cond_kwargs(env.neg_cond_kwargs, device))
                     log_prob_old_i = rollout_log_probs_list[i].to(device, dtype=torch.float32)
                     advantage_i = advantages[i]
-                    reward_i = rewards[i]
 
                     sde_idx = sde_step_indices_list[i]
                     if sde_idx is not None:
@@ -349,94 +380,128 @@ class FSDPTrainRayActor(TrainRayActor):
                         timesteps_i = timesteps_i[idx]
                         log_prob_old_i = log_prob_old_i[idx]
                         advantage_i = advantage_i[: idx.numel()]
-                        sample_train_steps = int(idx.numel())
+                        cur_T = int(idx.numel())
                     else:
-                        sample_train_steps = train_num_timesteps
+                        cur_T = train_num_timesteps
 
-                    # Batch multiple timesteps for GPU utilization.
-                    for t_start in range(0, sample_train_steps, timestep_batch):
-                        t_end = min(sample_train_steps, t_start + timestep_batch)
-                        tb = t_end - t_start
-                        lat_chunk = latents[t_start:t_end]
-                        ts_chunk = timesteps_i[t_start:t_end]
-
-                        # sgl-d's Qwen DiT divides timestep by num_train_timesteps
-                        # inside forward; diffusers' Qwen DiT does NOT — so we must
-                        # pre-scale here to land at the same time-embedding input.
-                        # Ref: sglang/.../models/dits/qwen_image.py (`timestep = timestep / 1000`).
-                        ts_chunk_for_model = ts_chunk / float(num_train_timesteps)
-
-                        pos_batch = tpc.expand_cond_for_timestep_batch(pos_cond, tb)
-
-                        # Match rollout's compute dtype exactly. Rollout runs under
-                        # torch.autocast("cuda", <dtype>) so all inputs enter the DiT
-                        # as that dtype. Without explicit cast here, FSDP MixedPrecision
-                        # only casts params but leaves fp32 inputs → first matmul runs
-                        # at higher precision than rollout → systematic noise_pred drift.
-                        # When diffusion_dtype=fp32, this is a no-op (inputs already fp32).
-                        _dt = self._compute_dtype
-                        _cast = lambda d: {k: v.to(_dt) if isinstance(v, torch.Tensor) else v for k, v in d.items()}
-                        noise_pred_pos = self.model(
-                            hidden_states=lat_chunk.to(_dt),
-                            timestep=ts_chunk_for_model.to(_dt),
-                            return_dict=False,
-                            **_cast(pos_batch),
-                        )[0]
-
-                        if use_cfg and neg_cond is not None:
-                            neg_batch = tpc.expand_cond_for_timestep_batch(neg_cond, tb)
-                            noise_pred_neg = self.model(
-                                hidden_states=lat_chunk.to(_dt),
-                                timestep=ts_chunk_for_model.to(_dt),
-                                return_dict=False,
-                                **_cast(neg_batch),
-                            )[0]
-                            noise_pred = tpc.cfg_combine(
-                                noise_pred_pos,
-                                noise_pred_neg,
-                                guidance_scale,
-                                true_cfg_scale=true_cfg_scale,
-                            )
-                        else:
-                            noise_pred = noise_pred_pos
-
-                        _, log_prob_new, _, _ = sde_step_with_logprob(
-                            self.scheduler,
-                            noise_pred.float(),
-                            timesteps_i[t_start:t_end],
-                            latents[t_start:t_end].float(),
-                            prev_sample=next_latents[t_start:t_end].float(),
-                            noise_level=noise_level,
+                    if T_sde is None:
+                        T_sde = cur_T
+                    else:
+                        # Per-sample SDE windows can start at different timesteps
+                        # but must have equal length so we can stack to (M, T_sde, ...).
+                        # `sde_window` strategy guarantees equal length by design.
+                        assert cur_T == T_sde, (
+                            f"per-sample SDE window length must match across microbatch "
+                            f"(got {T_sde} and {cur_T})"
                         )
 
-                        adv_chunk = advantage_i[t_start:t_end]
-                        old_chunk = log_prob_old_i[t_start:t_end]
+                    lat_list.append(latents)
+                    nxt_list.append(next_latents)
+                    ts_list.append(timesteps_i)
+                    lpo_list.append(log_prob_old_i)
+                    adv_list.append(advantage_i)
 
-                        ratio = torch.exp(log_prob_new - old_chunk)
-                        unclipped = -adv_chunk * ratio
-                        clipped = -adv_chunk * torch.clamp(
-                            ratio, 1.0 - clip_range, 1.0 + clip_range
+                # Stacked batch tensors. (M, T_sde, ...) where samples may have
+                # *different* timestep values per slot j (per-sample windows).
+                latents_mb = torch.stack(lat_list, dim=0)              # (M, T_sde, C, H, W)
+                next_latents_mb = torch.stack(nxt_list, dim=0)
+                timesteps_mb = torch.stack(ts_list, dim=0)             # (M, T_sde)
+                log_prob_old_mb = torch.stack(lpo_list, dim=0)         # (M, T_sde)
+                advantage_mb = torch.stack(adv_list, dim=0)            # (M, T_sde)
+
+                # Collate cond kwargs across the microbatch. For CFG, collate
+                # pos+neg jointly so encoder_hidden_states / mask use a unified
+                # max_seq_len across both halves and we can run one batch=2M
+                # DiT forward (mirroring flow_grpo's `compute_log_prob` cat).
+                if use_cfg:
+                    cond_collated = tpc.collate_cond_for_sample_batch(
+                        pos_kw_list + neg_kw_list, device
+                    )
+                else:
+                    cond_collated = tpc.collate_cond_for_sample_batch(pos_kw_list, device)
+                cond_kw = _cast_cond(cond_collated)
+
+                for j in range(T_sde):
+                    lat_j = latents_mb[:, j]                            # (M, C, H, W)
+                    nxt_j = next_latents_mb[:, j]                       # (M, C, H, W)
+                    ts_j = timesteps_mb[:, j]                           # (M,)
+                    lpo_j = log_prob_old_mb[:, j]                       # (M,)
+                    adv_j = advantage_mb[:, j]                          # (M,)
+
+                    # sgl-d's Qwen DiT divides timestep by num_train_timesteps
+                    # inside forward; diffusers' Qwen DiT does NOT — so we must
+                    # pre-scale here to land at the same time-embedding input.
+                    # Ref: sglang/.../models/dits/qwen_image.py (`timestep = timestep / 1000`).
+                    ts_for_model = ts_j / float(num_train_timesteps)
+
+                    if use_cfg:
+                        h = torch.cat([lat_j, lat_j], dim=0)            # (2M, C, H, W)
+                        ts_combined = torch.cat([ts_for_model, ts_for_model], dim=0)
+                    else:
+                        h = lat_j
+                        ts_combined = ts_for_model
+
+                    # Match rollout's compute dtype exactly. Rollout runs under
+                    # torch.autocast("cuda", <dtype>) so all inputs enter the DiT
+                    # as that dtype. Without explicit cast here, FSDP MixedPrecision
+                    # only casts params but leaves fp32 inputs → first matmul runs
+                    # at higher precision than rollout → systematic noise_pred drift.
+                    # When diffusion_dtype=fp32, this is a no-op (inputs already fp32).
+                    noise_pred_combined = self.model(
+                        hidden_states=h.to(_dt),
+                        timestep=ts_combined.to(_dt),
+                        return_dict=False,
+                        **cond_kw,
+                    )[0]
+
+                    if use_cfg:
+                        noise_pred_pos, noise_pred_neg = noise_pred_combined.chunk(2, dim=0)
+                        noise_pred = tpc.cfg_combine(
+                            noise_pred_pos,
+                            noise_pred_neg,
+                            guidance_scale,
+                            true_cfg_scale=true_cfg_scale,
                         )
-                        loss = torch.mean(torch.maximum(unclipped, clipped))
-                        if not getattr(self.args, "debug_skip_optimizer_step", False):
-                            (loss / num_microbatches / (sample_train_steps // timestep_batch)).backward()
+                    else:
+                        noise_pred = noise_pred_combined
 
-                        with torch.no_grad():
-                            per_elem = torch.maximum(unclipped, clipped)
-                            log_stats["loss"].append(loss.detach())
-                            # Diagnostic: abs-mean shows raw loss magnitude before sign cancellation
-                            log_stats["loss_abs_mean"].append(per_elem.abs().mean().detach())
-                            log_stats["adv_abs_mean"].append(adv_chunk.abs().mean().detach())
-                            log_stats["ratio_abs_minus_1"].append((ratio - 1.0).abs().mean().detach())
-                            log_stats["approx_kl"].append(
-                                0.5 * torch.mean((log_prob_new - old_chunk) ** 2).detach()
-                            )
-                            log_stats["clipfrac"].append(
-                                torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
-                            )
-                            log_stats["log_prob_new_idx_0"].append(log_prob_new[0].detach())
-                            log_stats["log_prob_old_idx_0"].append(old_chunk[0].detach())
-                            log_stats["log_prob_mean_abs_diff"].append(torch.mean(torch.abs(log_prob_new - old_chunk)).detach())
+                    _, log_prob_new, _, _ = sde_step_with_logprob(
+                        self.scheduler,
+                        noise_pred.float(),
+                        ts_j,
+                        lat_j.float(),
+                        prev_sample=nxt_j.float(),
+                        noise_level=noise_level,
+                    )                                                   # log_prob_new: (M,)
+
+                    ratio = torch.exp(log_prob_new - lpo_j)
+                    unclipped = -adv_j * ratio
+                    clipped = -adv_j * torch.clamp(
+                        ratio, 1.0 - clip_range, 1.0 + clip_range
+                    )
+                    loss = torch.mean(torch.maximum(unclipped, clipped))
+                    # Sample axis already mean-reduced by torch.mean above; only
+                    # the timestep loop remains, hence divide by T_sde to produce
+                    # the same total grad scale as the old per-sample-per-tchunk
+                    # accumulation (which divided by num_microbatches × T_sde/tb).
+                    if not getattr(self.args, "debug_skip_optimizer_step", False):
+                        (loss / T_sde).backward()
+
+                    with torch.no_grad():
+                        per_elem = torch.maximum(unclipped, clipped)
+                        log_stats["loss"].append(loss.detach())
+                        log_stats["loss_abs_mean"].append(per_elem.abs().mean().detach())
+                        log_stats["adv_abs_mean"].append(adv_j.abs().mean().detach())
+                        log_stats["ratio_abs_minus_1"].append((ratio - 1.0).abs().mean().detach())
+                        log_stats["approx_kl"].append(
+                            0.5 * torch.mean((log_prob_new - lpo_j) ** 2).detach()
+                        )
+                        log_stats["clipfrac"].append(
+                            torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
+                        )
+                        log_stats["log_prob_new_idx_0"].append(log_prob_new[0].detach())
+                        log_stats["log_prob_old_idx_0"].append(lpo_j[0].detach())
+                        log_stats["log_prob_mean_abs_diff"].append(torch.mean(torch.abs(log_prob_new - lpo_j)).detach())
 
                 self.prof.step(rollout_id=rollout_id)
                 # One optimizer step per step_id.

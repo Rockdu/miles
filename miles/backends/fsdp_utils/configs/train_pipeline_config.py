@@ -88,6 +88,21 @@ class TrainPipelineConfig(abc.ABC):
                 out[k] = v
         return out
 
+    def collate_cond_for_sample_batch(
+        self,
+        per_sample_cond_kwargs: list[dict],
+        device: torch.device,
+    ) -> dict:
+        """Stack a list of per-sample cond_kwargs (output of prepare_cond_kwargs)
+        into a single batched dict suitable for one DiT forward over M samples.
+
+        Model-specific because variable-length text embeds need padding + mask.
+        Default: naive concat along batch dim, only valid when shapes match.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must override collate_cond_for_sample_batch"
+        )
+
     @abc.abstractmethod
     def cfg_combine(
         self,

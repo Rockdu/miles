@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from miles.utils.types import CondKwargs
 
 from .train_pipeline_config import TrainPipelineConfig, register_train_pipeline_config
@@ -86,6 +87,63 @@ class QwenImageTrainPipelineConfig(TrainPipelineConfig):
         if cond.img_shapes:
             kwargs["img_shapes"] = cond.img_shapes
         return kwargs
+
+    def collate_cond_for_sample_batch(
+        self,
+        per_sample_cond_kwargs: list[dict],
+        device: torch.device,
+    ) -> dict:
+        """Pad+stack per-sample encoder_hidden_states to (M, max_len, D), build
+        the corresponding (M, max_len) bool mask from txt_seq_lens, and
+        list-concat img_shapes / txt_seq_lens. Mask isn't transmitted from
+        rollout — it is fully derivable from txt_seq_lens which is.
+        """
+        seq_lens: list[int] = []
+        encs: list[torch.Tensor] = []
+        img_shapes: list = []
+        for kw in per_sample_cond_kwargs:
+            lens = kw.get("txt_seq_lens") or []
+            assert len(lens) == 1, (
+                f"collate expects per-sample cond_kwargs with txt_seq_lens of length 1, "
+                f"got {lens}"
+            )
+            L = int(lens[0])
+            seq_lens.append(L)
+            enc = kw["encoder_hidden_states"]   # (1, L_i, D) — L_i may equal L or be padded already
+            assert enc.shape[0] == 1, (
+                f"collate expects per-sample encoder_hidden_states with batch=1, got {tuple(enc.shape)}"
+            )
+            encs.append(enc)
+            shapes = kw.get("img_shapes") or []
+            assert len(shapes) == 1, (
+                f"collate expects per-sample img_shapes of length 1, got {shapes}"
+            )
+            img_shapes.append(shapes[0])
+
+        max_len = max(seq_lens)
+        padded = []
+        for enc, L in zip(encs, seq_lens):
+            cur_len = enc.shape[1]
+            if cur_len < max_len:
+                # pad seq dim on the right; F.pad with 4-tuple pads the last 2 dims
+                # (..., D, L) → pad last dim 0, pad second-last dim by max_len - cur_len.
+                enc = F.pad(enc, (0, 0, 0, max_len - cur_len))
+            elif cur_len > max_len:
+                enc = enc[:, :max_len, :]
+            padded.append(enc)
+        encoder_hidden_states = torch.cat(padded, dim=0).to(device)   # (M, max_len, D)
+
+        mask = (
+            torch.arange(max_len, device=device).unsqueeze(0)
+            < torch.tensor(seq_lens, device=device).unsqueeze(1)
+        )                                                              # (M, max_len) bool
+
+        return {
+            "encoder_hidden_states": encoder_hidden_states,
+            "encoder_hidden_states_mask": mask,
+            "txt_seq_lens": seq_lens,
+            "img_shapes": img_shapes,
+        }
 
     def cfg_combine(
         self,
