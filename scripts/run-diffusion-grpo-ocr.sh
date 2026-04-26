@@ -6,20 +6,20 @@
 # parameter rollout-num-gpus and --rollout-num-gpus-per-engine  only makes sense in sglang diffusion case.
 #!/usr/bin/env bash
 
-# for rerun the task
-pkill -9 sgl*
-sleep 3
-ray stop --force
-pkill -9 ray*
-pkill -9 python*
-sleep 3
-pkill -9 ray*
-pkill -9 python*
-
-
-# pkill can't reap zombies — kill their live parents so init reaps them.
-ps -eo ppid,state,comm --no-headers | awk '$2=="Z" && $1!=1 && $3~/ray|python|sglang/ {print $1}' | sort -u | xargs -r kill -9 2>/dev/null || true
-sleep 2
+# NOTE: cleanup pkill / ray-stop block intentionally disabled — these are
+# global (pkill python*, ray stop --force) and would kill any concurrent
+# training on other GPUs. Re-enable manually only if no other trainings are
+# running.
+# pkill -9 sgl*
+# sleep 3
+# ray stop --force
+# pkill -9 ray*
+# pkill -9 python*
+# sleep 3
+# pkill -9 ray*
+# pkill -9 python*
+# ps -eo ppid,state,comm --no-headers | awk '$2=="Z" && $1!=1 && $3~/ray|python|sglang/ {print $1}' | sort -u | xargs -r kill -9 2>/dev/null || true
+# sleep 2
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
