@@ -1403,41 +1403,35 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Number of Ray OCR actors used when --rm-type ocr.",
             )
             parser.add_argument(
-                "--pickscore-num-workers",
+                "--hps-num-workers",
                 type=int,
                 default=1,
-                help="Number of Ray PickScore actors used when --rm-type pickscore.",
+                help="Number of Ray HPS actors used when --rm-type hps.",
             )
             parser.add_argument(
-                "--pickscore-num-gpus-per-worker",
+                "--hps-num-gpus-per-worker",
                 type=float,
                 default=1.0,
-                help="GPU resources per PickScore actor. Use 1.0 for a dedicated GPU smoke test.",
+                help="GPU resources per HPS actor. Use 1.0 for a dedicated GPU smoke test.",
             )
             parser.add_argument(
-                "--pickscore-batch-size",
+                "--hps-batch-size",
                 type=int,
                 default=8,
-                help="Batch size per PickScore actor call.",
-            )
-            parser.add_argument(
-                "--pickscore-processor-path",
-                type=str,
-                default=None,
-                help="Hugging Face processor path for PickScore. Required when --rm-type pickscore.",
-            )
-            parser.add_argument(
-                "--pickscore-model-path",
-                type=str,
-                default=None,
-                help="Hugging Face model path for PickScore. Required when --rm-type pickscore.",
+                help="Batch size per HPS actor call.",
             )
             parser.add_argument(
                 "--hps-version",
                 type=str,
                 default="v2.1",
                 choices=["v2.0", "v2.1"],
-                help="HPS checkpoint version to use when --rm-type hps. v2.1 (default) is trained on a higher-quality preference dataset than v2.0.",
+                help="HPS checkpoint version to use when --rm-type hps.",
+            )
+            parser.add_argument(
+                "--hps-checkpoint-path",
+                type=str,
+                default=None,
+                help="Optional local HPS checkpoint path. If unset, the checkpoint is downloaded from Hugging Face.",
             )
             parser.add_argument(
                 "--custom-rm-path",

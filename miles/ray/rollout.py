@@ -345,10 +345,10 @@ class RolloutManager:
 
         if self.args.grpo_std_normalization:
             if self.args.globalize_reward_std:
-                std = rewards_flat.std(correction=0)
+                std = rewards_flat.std()
             else:
-                std = rewards.std(dim=-1, keepdim=True, correction=0)
-            # matches flow_grpo's np.std(...)+1e-4 in both stat_tracking branches
+                std = rewards.std(dim=-1, keepdim=True)
+            # matches flow_grpo's `+ 1e-4` in both stat_tracking branches
             rewards = rewards / (std + 1e-4)
 
         return raw_rewards, rewards.flatten().tolist()

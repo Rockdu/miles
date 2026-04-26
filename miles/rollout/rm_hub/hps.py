@@ -12,17 +12,21 @@ from PIL import Image
 from miles.utils.misc import SingletonMeta
 from miles.utils.types import Sample
 
-from .pickscore import _sample_to_rgb_hwc_uint8
-
 logger = logging.getLogger(__name__)
 
 
-# Hardcoded actor-pool defaults — promote to CLI flags only if a real run
-# needs to vary them. PickScore exposes these as --pickscore-* args; HPS
-# starts minimal and matches PickScore's smoke defaults.
-_HPS_NUM_WORKERS = 1
-_HPS_NUM_GPUS_PER_WORKER = 1.0
-_HPS_BATCH_SIZE = 8
+def _sample_to_rgb_hwc_uint8(sample: Sample) -> np.ndarray:
+    t = sample.generated_output
+    if t is None:
+        raise ValueError("generated_output is None")
+    if t.ndim != 4:
+        raise ValueError(f"generated_output must be 4D [C, F, H, W], got {tuple(t.shape)}")
+
+    frame_chw = t.detach().cpu()[:, 0, :, :]
+    hwc = frame_chw.float().numpy().transpose(1, 2, 0)
+    if float(hwc.max()) <= 1.0 + 1e-3:
+        hwc = np.round(hwc * 255.0)
+    return np.ascontiguousarray(hwc.clip(0, 255).astype(np.uint8))
 
 
 class HPSScorer(torch.nn.Module):
@@ -83,6 +87,9 @@ class HPSScorer(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, prompts: Sequence[str], images: Sequence[Image.Image]) -> list[float]:
+        if not prompts:
+            return []
+
         image_batch = torch.stack([self.preprocess(img) for img in images]).to(
             self.device, non_blocking=True
         )
@@ -106,8 +113,7 @@ class HPSRewardActor:
         hps_version: str,
         checkpoint_path: str | None = None,
     ) -> None:
-        gpu_ids = ray.get_gpu_ids()
-        use_cuda = bool(gpu_ids) and torch.cuda.is_available()
+        use_cuda = bool(ray.get_gpu_ids()) and torch.cuda.is_available()
         if use_cuda:
             torch.cuda.set_device(0)
         device = "cuda" if use_cuda else "cpu"
@@ -126,27 +132,32 @@ class AsyncHPSPool(metaclass=SingletonMeta):
     """Ray actor pool for GPU HPS reward inference."""
 
     def __init__(self, args) -> None:
-        hps_version = getattr(args, "hps_version", "v2.1")
-        checkpoint_path = getattr(args, "hps_checkpoint_path", None)
-        self._batch_size = _HPS_BATCH_SIZE
+        num_workers = args.hps_num_workers
+        num_gpus_per_worker = args.hps_num_gpus_per_worker
+        if num_workers <= 0:
+            raise ValueError("--hps-num-workers must be positive")
+        if args.hps_batch_size <= 0:
+            raise ValueError("--hps-batch-size must be positive")
+
+        self._batch_size = args.hps_batch_size
         self._actors = [
             HPSRewardActor.options(
                 num_cpus=1,
-                num_gpus=_HPS_NUM_GPUS_PER_WORKER,
+                num_gpus=num_gpus_per_worker,
                 scheduling_strategy="DEFAULT",
             ).remote(
-                hps_version=hps_version,
-                checkpoint_path=checkpoint_path,
+                hps_version=args.hps_version,
+                checkpoint_path=args.hps_checkpoint_path,
             )
-            for _ in range(_HPS_NUM_WORKERS)
+            for _ in range(num_workers)
         ]
         self._round_robin_index = 0
         logger.info(
             "Initialized HPS actor pool with %d workers, %.3f GPUs/worker, batch_size=%d, version=%s.",
-            _HPS_NUM_WORKERS,
-            _HPS_NUM_GPUS_PER_WORKER,
+            num_workers,
+            num_gpus_per_worker,
             self._batch_size,
-            hps_version,
+            args.hps_version,
         )
 
     def _next_actor(self):
@@ -155,6 +166,9 @@ class AsyncHPSPool(metaclass=SingletonMeta):
         return self._actors[i]
 
     async def score(self, images: list[np.ndarray], prompts: list[str]) -> list[float]:
+        if not images:
+            return []
+
         refs = []
         for start in range(0, len(images), self._batch_size):
             end = start + self._batch_size

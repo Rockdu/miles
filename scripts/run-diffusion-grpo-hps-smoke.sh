@@ -10,6 +10,8 @@ SMOKE_ACTOR_GPUS_PER_NODE="${SMOKE_ACTOR_GPUS_PER_NODE:-2}"
 SMOKE_ROLLOUT_GPUS="${SMOKE_ROLLOUT_GPUS:-2}"
 SMOKE_ROLLOUT_GPUS_PER_ENGINE="${SMOKE_ROLLOUT_GPUS_PER_ENGINE:-1}"
 SMOKE_HPS_VERSION="${SMOKE_HPS_VERSION:-v2.1}"
+SMOKE_HPS_NUM_WORKERS="${SMOKE_HPS_NUM_WORKERS:-1}"
+SMOKE_HPS_BATCH_SIZE="${SMOKE_HPS_BATCH_SIZE:-8}"
 
 COLOCATE_ARGS=()
 if [[ "${SMOKE_COLOCATE}" == "1" || "${SMOKE_COLOCATE}" == "true" || "${SMOKE_COLOCATE}" == "yes" ]]; then
@@ -75,11 +77,14 @@ fi
   --globalize-reward-std \
   --rm-type hps \
   --hps-version "${SMOKE_HPS_VERSION}" \
+  --hps-num-workers "${SMOKE_HPS_NUM_WORKERS}" \
+  --hps-num-gpus-per-worker 1 \
+  --hps-batch-size "${SMOKE_HPS_BATCH_SIZE}" \
   --diffusion-dtype bf16 \
   --diffusion-num-steps 10 \
   --diffusion-guidance-scale 4.0 \
   --diffusion-true-cfg-scale 4.0 \
-  --diffusion-rollout-noise-level 1.2 \
+  --diffusion-noise-level 1.2 \
   --diffusion-step-strategy-path miles.rollout.step_strategy_hub.sde_window \
   --diffusion-sde-window-size 2 \
   --diffusion-sde-window-range 0,5 \
@@ -87,6 +92,6 @@ fi
   --diffusion-width 256 \
   --global-batch-size 2 \
   --diffusion-ignore-last 1 \
-  --diffusion-rollout-debug-mode \
+  --diffusion-debug-mode \
   --debug-skip-optimizer-step \
   "${WANDB_ARGS[@]}"
