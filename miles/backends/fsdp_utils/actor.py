@@ -274,13 +274,22 @@ class FSDPTrainRayActor(TrainRayActor):
     def _train_core(self, rollout_id: int, rollout_data) -> None:
         """Diffusion GRPO training loop, aligned with flow GRPO.
 
-        Flow GRPO reference: sglang/3rdparty/flow_grpo/scripts/train_sd3.py:869-944
-        Per timestep j:
-          1. noise_pred = DiT(latents[j], timesteps[j], encoder_hidden_states)
-          2. _, log_prob_new, _, _ = sde_step_with_logprob(scheduler, noise_pred, ...)
-          3. ratio = exp(log_prob_new - log_prob_old[j])
-          4. loss = max(-adv[j] * ratio, -adv[j] * clamp(ratio))
-          5. loss.backward()
+        Per optim window of M samples × T_sde timesteps, slide a
+        (sample_microbatch, tstep_microbatch) tile across the (M, T_sde) grid
+        and accumulate gradients. Two presets:
+
+          sample_microbatch=M, tstep_microbatch=1, iter_order=sample_major
+            equivalent to "batch by samples" (forward batch = M, loop T_sde
+            times); peak activation memory ∝ M.
+
+          sample_microbatch=1, tstep_microbatch=T_sde, iter_order=timestep_major
+            equivalent to "batch by timesteps" (forward batch = T_sde, loop M
+            times); peak activation memory ∝ T_sde.
+
+        Loss scaling is uniform across plans: per-tile mean PPO loss / n_tiles
+        → net gradient = mean over (M, T_sde), matching the all-timesteps
+        accumulation grad scale flow_grpo and the previous miles-d sample-major
+        loop produce.
         """
         device = torch.cuda.current_device()
 
@@ -288,7 +297,6 @@ class FSDPTrainRayActor(TrainRayActor):
         dit_trajectories = rollout_data["dit_trajectory"]
         rewards = torch.tensor(rollout_data["rewards"], device=device, dtype=torch.float32)
         rollout_log_probs_list = rollout_data["rollout_log_probs"]
-        rollout_debug_list = rollout_data.get("rollout_debug_tensors") or [None] * len(denoising_envs)
         sde_step_indices_list = rollout_data.get("sde_step_indices") or [None] * len(denoising_envs)
 
         batch_size = len(denoising_envs)
@@ -320,208 +328,419 @@ class FSDPTrainRayActor(TrainRayActor):
         self.scheduler._begin_index = None
 
         train_num_timesteps = max(1, num_timesteps)
-
         num_microbatches = max(1, int(getattr(self.args, "num_microbatches", 1)))
-        # `--diffusion-timestep-batch` is retained for backward CLI compat but
-        # superseded by sample-dim batching: each DiT forward now processes the
-        # whole microbatch (M samples) at one timestep, mirroring flow_grpo's
-        # `compute_log_prob` which batches in the sample dim and loops timesteps.
         num_steps_per_rollout = (batch_size + num_microbatches - 1) // num_microbatches
 
         tpc = self.train_pipeline_config
-        _dt = self._compute_dtype
 
-        def _cast_cond(d: dict) -> dict:
-            """Cast floating-point tensors to compute dtype; leave bool masks /
-            lists unchanged. The bool encoder_hidden_states_mask must NOT be
-            cast to bf16 — diffusers reads it as a bool / int mask.
-            """
-            out: dict = {}
-            for k, v in d.items():
-                if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
-                    out[k] = v.to(_dt)
-                else:
-                    out[k] = v
-            return out
+        # Plan: (sample_microbatch, tstep_microbatch, iter_order). Defaults
+        # reproduce the previous "batch by samples" behavior.
+        sample_mb_arg = getattr(self.args, "diffusion_train_sample_microbatch", None)
+        tstep_mb_arg = max(1, int(getattr(self.args, "diffusion_train_tstep_microbatch", 1)))
+        iter_order = getattr(self.args, "diffusion_train_iter_order", "sample_major")
+        assert iter_order in ("sample_major", "timestep_major"), iter_order
 
         with timer("actor_train"):
             for step_id in range(num_steps_per_rollout):
                 self.optimizer.zero_grad(set_to_none=True)
-                log_stats = defaultdict(list)
 
                 traj_start = step_id * num_microbatches
                 traj_end = min(batch_size, traj_start + num_microbatches)
-                M = traj_end - traj_start
+                grids = self._build_train_grids(
+                    traj_start=traj_start,
+                    traj_end=traj_end,
+                    dit_trajectories=dit_trajectories,
+                    denoising_envs=denoising_envs,
+                    rollout_log_probs_list=rollout_log_probs_list,
+                    sde_step_indices_list=sde_step_indices_list,
+                    advantages=advantages,
+                    train_num_timesteps=train_num_timesteps,
+                    use_cfg=use_cfg,
+                    device=device,
+                )
 
-                # Per-sample preparation collected into lists, then stacked.
-                lat_list: list[torch.Tensor] = []
-                nxt_list: list[torch.Tensor] = []
-                ts_list: list[torch.Tensor] = []
-                lpo_list: list[torch.Tensor] = []
-                adv_list: list[torch.Tensor] = []
-                pos_kw_list: list[dict] = []
-                neg_kw_list: list[dict] = []
-                T_sde: int | None = None
+                # Effective tile sizes, clamped to the grid.
+                M_w, T_w = grids["M"], grids["T_sde"]
+                sm = min(sample_mb_arg if sample_mb_arg is not None else M_w, M_w)
+                tm = min(tstep_mb_arg, T_w)
+                sm = max(1, sm)
+                tm = max(1, tm)
 
-                for i in range(traj_start, traj_end):
-                    latents, next_latents, timesteps_i = tpc.prepare_trajectory(dit_trajectories[i], device)
-                    env = denoising_envs[i]
-                    pos_kw_list.append(tpc.prepare_cond_kwargs(env.pos_cond_kwargs, device))
-                    if use_cfg:
-                        neg_kw_list.append(tpc.prepare_cond_kwargs(env.neg_cond_kwargs, device))
-                    log_prob_old_i = rollout_log_probs_list[i].to(device, dtype=torch.float32)
-                    advantage_i = advantages[i]
-
-                    sde_idx = sde_step_indices_list[i]
-                    if sde_idx is not None:
-                        idx = torch.as_tensor(sde_idx, device=device, dtype=torch.long)
-                        latents = latents[idx]
-                        next_latents = next_latents[idx]
-                        timesteps_i = timesteps_i[idx]
-                        log_prob_old_i = log_prob_old_i[idx]
-                        advantage_i = advantage_i[: idx.numel()]
-                        cur_T = int(idx.numel())
-                    else:
-                        cur_T = train_num_timesteps
-
-                    if T_sde is None:
-                        T_sde = cur_T
-                    else:
-                        # Per-sample SDE windows can start at different timesteps
-                        # but must have equal length so we can stack to (M, T_sde, ...).
-                        # `sde_window` strategy guarantees equal length by design.
-                        assert cur_T == T_sde, (
-                            f"per-sample SDE window length must match across microbatch "
-                            f"(got {T_sde} and {cur_T})"
-                        )
-
-                    lat_list.append(latents)
-                    nxt_list.append(next_latents)
-                    ts_list.append(timesteps_i)
-                    lpo_list.append(log_prob_old_i)
-                    adv_list.append(advantage_i)
-
-                # Stacked batch tensors. (M, T_sde, ...) where samples may have
-                # *different* timestep values per slot j (per-sample windows).
-                latents_mb = torch.stack(lat_list, dim=0)              # (M, T_sde, C, H, W)
-                next_latents_mb = torch.stack(nxt_list, dim=0)
-                timesteps_mb = torch.stack(ts_list, dim=0)             # (M, T_sde)
-                log_prob_old_mb = torch.stack(lpo_list, dim=0)         # (M, T_sde)
-                advantage_mb = torch.stack(adv_list, dim=0)            # (M, T_sde)
-
-                # Collate cond kwargs across the microbatch. For CFG, collate
-                # pos+neg jointly so encoder_hidden_states / mask use a unified
-                # max_seq_len across both halves and we can run one batch=2M
-                # DiT forward (mirroring flow_grpo's `compute_log_prob` cat).
-                if use_cfg:
-                    cond_collated = tpc.collate_cond_for_sample_batch(
-                        pos_kw_list + neg_kw_list, device
-                    )
-                else:
-                    cond_collated = tpc.collate_cond_for_sample_batch(pos_kw_list, device)
-                cond_kw = _cast_cond(cond_collated)
-
-                for j in range(T_sde):
-                    lat_j = latents_mb[:, j]                            # (M, C, H, W)
-                    nxt_j = next_latents_mb[:, j]                       # (M, C, H, W)
-                    ts_j = timesteps_mb[:, j]                           # (M,)
-                    lpo_j = log_prob_old_mb[:, j]                       # (M,)
-                    adv_j = advantage_mb[:, j]                          # (M,)
-
-                    # sgl-d's Qwen DiT divides timestep by num_train_timesteps
-                    # inside forward; diffusers' Qwen DiT does NOT — so we must
-                    # pre-scale here to land at the same time-embedding input.
-                    # Ref: sglang/.../models/dits/qwen_image.py (`timestep = timestep / 1000`).
-                    ts_for_model = ts_j / float(num_train_timesteps)
-
-                    if use_cfg:
-                        h = torch.cat([lat_j, lat_j], dim=0)            # (2M, C, H, W)
-                        ts_combined = torch.cat([ts_for_model, ts_for_model], dim=0)
-                    else:
-                        h = lat_j
-                        ts_combined = ts_for_model
-
-                    # Match rollout's compute dtype exactly. Rollout runs under
-                    # torch.autocast("cuda", <dtype>) so all inputs enter the DiT
-                    # as that dtype. Without explicit cast here, FSDP MixedPrecision
-                    # only casts params but leaves fp32 inputs → first matmul runs
-                    # at higher precision than rollout → systematic noise_pred drift.
-                    # When diffusion_dtype=fp32, this is a no-op (inputs already fp32).
-                    noise_pred_combined = self.model(
-                        hidden_states=h.to(_dt),
-                        timestep=ts_combined.to(_dt),
-                        return_dict=False,
-                        **cond_kw,
-                    )[0]
-
-                    if use_cfg:
-                        noise_pred_pos, noise_pred_neg = noise_pred_combined.chunk(2, dim=0)
-                        noise_pred = tpc.cfg_combine(
-                            noise_pred_pos,
-                            noise_pred_neg,
-                            guidance_scale,
-                            true_cfg_scale=true_cfg_scale,
-                        )
-                    else:
-                        noise_pred = noise_pred_combined
-
-                    _, log_prob_new, _, _ = sde_step_with_logprob(
-                        self.scheduler,
-                        noise_pred.float(),
-                        ts_j,
-                        lat_j.float(),
-                        prev_sample=nxt_j.float(),
-                        noise_level=noise_level,
-                    )                                                   # log_prob_new: (M,)
-
-                    ratio = torch.exp(log_prob_new - lpo_j)
-                    unclipped = -adv_j * ratio
-                    clipped = -adv_j * torch.clamp(
-                        ratio, 1.0 - clip_range, 1.0 + clip_range
-                    )
-                    loss = torch.mean(torch.maximum(unclipped, clipped))
-                    # Sample axis already mean-reduced by torch.mean above; only
-                    # the timestep loop remains, hence divide by T_sde to produce
-                    # the same total grad scale as the old per-sample-per-tchunk
-                    # accumulation (which divided by num_microbatches × T_sde/tb).
-                    if not getattr(self.args, "debug_skip_optimizer_step", False):
-                        (loss / T_sde).backward()
-
-                    with torch.no_grad():
-                        per_elem = torch.maximum(unclipped, clipped)
-                        log_stats["loss"].append(loss.detach())
-                        log_stats["loss_abs_mean"].append(per_elem.abs().mean().detach())
-                        log_stats["adv_abs_mean"].append(adv_j.abs().mean().detach())
-                        log_stats["ratio_abs_minus_1"].append((ratio - 1.0).abs().mean().detach())
-                        log_stats["approx_kl"].append(
-                            0.5 * torch.mean((log_prob_new - lpo_j) ** 2).detach()
-                        )
-                        log_stats["clipfrac"].append(
-                            torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
-                        )
-                        log_stats["log_prob_new_idx_0"].append(log_prob_new[0].detach())
-                        log_stats["log_prob_old_idx_0"].append(lpo_j[0].detach())
-                        log_stats["log_prob_mean_abs_diff"].append(torch.mean(torch.abs(log_prob_new - lpo_j)).detach())
+                log_stats = self._run_optim_window(
+                    grids=grids,
+                    sample_mb=sm,
+                    tstep_mb=tm,
+                    iter_order=iter_order,
+                    use_cfg=use_cfg,
+                    guidance_scale=guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
+                    clip_range=clip_range,
+                    noise_level=noise_level,
+                    num_train_timesteps=num_train_timesteps,
+                )
 
                 self.prof.step(rollout_id=rollout_id)
-                # One optimizer step per step_id.
                 if not getattr(self.args, "debug_skip_optimizer_step", False):
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                     log_stats["grad_norm"].append(grad_norm.detach())
                     self.optimizer.step()
                     self.lr_scheduler.step()
                 else:
-                    # Keep weights frozen so noise_pred / log_prob alignment checks
-                    # remain interpretable across iterations.
+                    # Keep weights frozen so noise_pred / log_prob alignment
+                    # checks remain interpretable across iterations.
                     self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
 
-                # Prefix with "train/" so wandb groups these under the Train panel
-                # and picks up define_metric("train/*", step_metric="train/step") —
-                # otherwise they fall into the default "Charts" section and plot
-                # against wandb's auto-incrementing internal step.
+                # Prefix with "train/" so wandb groups these under the Train
+                # panel and picks up define_metric("train/*",
+                # step_metric="train/step") — otherwise they fall into the
+                # default "Charts" section and plot against wandb's
+                # auto-incrementing internal step.
                 reduced = {f"train/{k}": torch.stack(v).mean().item() for k, v in log_stats.items()}
                 self._gather_and_log_metrics(rollout_id, reduced, step=self.global_step)
+
+    def _build_train_grids(
+        self,
+        *,
+        traj_start: int,
+        traj_end: int,
+        dit_trajectories: list,
+        denoising_envs: list,
+        rollout_log_probs_list: list,
+        sde_step_indices_list: list,
+        advantages: torch.Tensor,
+        train_num_timesteps: int,
+        use_cfg: bool,
+        device: torch.device,
+    ) -> dict:
+        """Build per-window (M, T_sde, ...) grids ready for tile slicing.
+
+        Per-sample SDE windows can start at different timesteps but must have
+        equal length T_sde so they stack cleanly. The `sde_window` strategy
+        guarantees this.
+        """
+        tpc = self.train_pipeline_config
+
+        lat_list, nxt_list, ts_list, lpo_list, adv_list = [], [], [], [], []
+        pos_kw_list, neg_kw_list = [], []
+        T_sde: int | None = None
+
+        for i in range(traj_start, traj_end):
+            latents, next_latents, timesteps_i = tpc.prepare_trajectory(dit_trajectories[i], device)
+            env = denoising_envs[i]
+            pos_kw_list.append(tpc.prepare_cond_kwargs(env.pos_cond_kwargs, device))
+            if use_cfg:
+                neg_kw_list.append(tpc.prepare_cond_kwargs(env.neg_cond_kwargs, device))
+            log_prob_old_i = rollout_log_probs_list[i].to(device, dtype=torch.float32)
+            advantage_i = advantages[i]
+
+            sde_idx = sde_step_indices_list[i]
+            if sde_idx is not None:
+                idx = torch.as_tensor(sde_idx, device=device, dtype=torch.long)
+                latents = latents[idx]
+                next_latents = next_latents[idx]
+                timesteps_i = timesteps_i[idx]
+                log_prob_old_i = log_prob_old_i[idx]
+                advantage_i = advantage_i[: idx.numel()]
+                cur_T = int(idx.numel())
+            else:
+                cur_T = train_num_timesteps
+
+            if T_sde is None:
+                T_sde = cur_T
+            else:
+                assert cur_T == T_sde, (
+                    f"per-sample SDE window length must match across microbatch "
+                    f"(got {T_sde} and {cur_T})"
+                )
+            lat_list.append(latents)
+            nxt_list.append(next_latents)
+            ts_list.append(timesteps_i)
+            lpo_list.append(log_prob_old_i)
+            adv_list.append(advantage_i)
+
+        # Stacked grids — (M, T_sde, ...).
+        latents_mb = torch.stack(lat_list, dim=0)
+        next_latents_mb = torch.stack(nxt_list, dim=0)
+        timesteps_mb = torch.stack(ts_list, dim=0)
+        log_prob_old_mb = torch.stack(lpo_list, dim=0)
+        advantage_mb = torch.stack(adv_list, dim=0)
+
+        # Collate cond kwargs once for the whole window. For CFG, pack
+        # [pos | neg] into a single (2M, ...) collate so they share a unified
+        # max_seq_len; tile slicing then re-splits the halves.
+        if use_cfg:
+            cond_collated = self.train_pipeline_config.collate_cond_for_sample_batch(
+                pos_kw_list + neg_kw_list, device
+            )
+        else:
+            cond_collated = self.train_pipeline_config.collate_cond_for_sample_batch(
+                pos_kw_list, device
+            )
+
+        return {
+            "lat": latents_mb,
+            "nxt": next_latents_mb,
+            "ts": timesteps_mb,
+            "lpo": log_prob_old_mb,
+            "adv": advantage_mb,
+            "cond": cond_collated,
+            "M": int(traj_end - traj_start),
+            "T_sde": int(T_sde or 0),
+        }
+
+    def _run_optim_window(
+        self,
+        *,
+        grids: dict,
+        sample_mb: int,
+        tstep_mb: int,
+        iter_order: str,
+        use_cfg: bool,
+        guidance_scale: float,
+        true_cfg_scale: float | None,
+        clip_range: float,
+        noise_level: float,
+        num_train_timesteps: int,
+    ) -> dict[str, list[torch.Tensor]]:
+        """Iterate (sample_mb × tstep_mb) tiles across the (M, T_sde) grid,
+        running one DiT forward + PPO loss + backward per tile.
+
+        All tiles share the same loss scaling: ``(loss_tile / n_tiles).backward()``.
+        Net gradient is therefore mean over (M × T_sde) cells regardless of
+        plan — flipping plans changes wall-clock and memory, not the optimizer
+        update direction (modulo bf16 reduction order).
+        """
+        device = grids["lat"].device
+        M, T = grids["M"], grids["T_sde"]
+        s_chunks = _chunked_indices(M, sample_mb, device)
+        t_chunks = _chunked_indices(T, tstep_mb, device)
+        n_tiles = len(s_chunks) * len(t_chunks)
+
+        if iter_order == "sample_major":
+            outer, inner = t_chunks, s_chunks
+        else:
+            outer, inner = s_chunks, t_chunks
+
+        log_stats: dict[str, list[torch.Tensor]] = defaultdict(list)
+        skip_step = bool(getattr(self.args, "debug_skip_optimizer_step", False))
+
+        for o in outer:
+            for i in inner:
+                s_idx, t_idx = (i, o) if iter_order == "sample_major" else (o, i)
+                loss = self._forward_tile(
+                    s_idx=s_idx,
+                    t_idx=t_idx,
+                    grids=grids,
+                    use_cfg=use_cfg,
+                    guidance_scale=guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
+                    clip_range=clip_range,
+                    noise_level=noise_level,
+                    num_train_timesteps=num_train_timesteps,
+                    log_stats=log_stats,
+                )
+                if not skip_step:
+                    (loss / n_tiles).backward()
+
+        return log_stats
+
+    def _forward_tile(
+        self,
+        *,
+        s_idx: torch.Tensor,
+        t_idx: torch.Tensor,
+        grids: dict,
+        use_cfg: bool,
+        guidance_scale: float,
+        true_cfg_scale: float | None,
+        clip_range: float,
+        noise_level: float,
+        num_train_timesteps: int,
+        log_stats: dict[str, list[torch.Tensor]],
+    ) -> torch.Tensor:
+        """One DiT forward over an (m, k) tile flattened to batch=(m*k).
+
+        Inputs:
+          s_idx: 1-D LongTensor — sample-axis indices into M (size m).
+          t_idx: 1-D LongTensor — timestep-axis indices into T_sde (size k).
+
+        Returns the mean PPO loss for the tile (scalar). Caller scales by
+        1/n_tiles before backward.
+        """
+        device = grids["lat"].device
+        _dt = self._compute_dtype
+        tpc = self.train_pipeline_config
+        m, k = int(s_idx.numel()), int(t_idx.numel())
+        M_total = grids["M"]
+
+        # (m, k, ...) → (m*k, ...) for one DiT forward.
+        lat_tile = grids["lat"][s_idx][:, t_idx]                # (m, k, C, H, W)
+        nxt_tile = grids["nxt"][s_idx][:, t_idx]
+        ts_tile = grids["ts"][s_idx][:, t_idx]                  # (m, k)
+        lpo_tile = grids["lpo"][s_idx][:, t_idx]                # (m, k)
+        adv_tile = grids["adv"][s_idx][:, t_idx]                # (m, k)
+
+        h_flat = lat_tile.reshape(m * k, *lat_tile.shape[2:])
+        ts_flat = ts_tile.reshape(m * k)
+
+        # sgl-d's Qwen DiT divides timestep by num_train_timesteps inside
+        # forward; diffusers' Qwen DiT does NOT — pre-scale here so both
+        # land at the same time-embedding input.
+        ts_for_model = ts_flat / float(num_train_timesteps)
+
+        cond_tile = _slice_collated_cond(
+            grids["cond"], s_idx=s_idx, k=k, M_total=M_total, use_cfg=use_cfg
+        )
+        cond_tile = _cast_cond_to_dtype(cond_tile, _dt)
+
+        if use_cfg:
+            h = torch.cat([h_flat, h_flat], dim=0)              # (2*m*k, C, H, W)
+            ts_combined = torch.cat([ts_for_model, ts_for_model], dim=0)
+        else:
+            h = h_flat
+            ts_combined = ts_for_model
+
+        # Match rollout's compute dtype exactly. Rollout runs under
+        # torch.autocast("cuda", <dtype>) so all inputs enter the DiT as
+        # that dtype. Without explicit cast here, FSDP MixedPrecision only
+        # casts params but leaves fp32 inputs → first matmul runs at higher
+        # precision than rollout → systematic noise_pred drift.
+        noise_pred_combined = self.model(
+            hidden_states=h.to(_dt),
+            timestep=ts_combined.to(_dt),
+            return_dict=False,
+            **cond_tile,
+        )[0]
+
+        if use_cfg:
+            noise_pred_pos, noise_pred_neg = noise_pred_combined.chunk(2, dim=0)
+            noise_pred_flat = tpc.cfg_combine(
+                noise_pred_pos,
+                noise_pred_neg,
+                guidance_scale,
+                true_cfg_scale=true_cfg_scale,
+            )
+        else:
+            noise_pred_flat = noise_pred_combined
+
+        # SDE log-prob is per-element along batch; (m*k,) in/out.
+        _, log_prob_new_flat, _, _ = sde_step_with_logprob(
+            self.scheduler,
+            noise_pred_flat.float(),
+            ts_flat,
+            h_flat.float(),
+            prev_sample=nxt_tile.reshape(m * k, *nxt_tile.shape[2:]).float(),
+            noise_level=noise_level,
+        )                                                       # (m*k,)
+        log_prob_new = log_prob_new_flat.reshape(m, k)
+        ratio = torch.exp(log_prob_new - lpo_tile)
+        unclipped = -adv_tile * ratio
+        clipped = -adv_tile * torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range)
+        per_cell = torch.maximum(unclipped, clipped)
+        loss = per_cell.mean()
+
+        with torch.no_grad():
+            log_stats["loss"].append(loss.detach())
+            log_stats["loss_abs_mean"].append(per_cell.abs().mean().detach())
+            log_stats["adv_abs_mean"].append(adv_tile.abs().mean().detach())
+            log_stats["ratio_abs_minus_1"].append((ratio - 1.0).abs().mean().detach())
+            log_stats["approx_kl"].append(
+                0.5 * torch.mean((log_prob_new - lpo_tile) ** 2).detach()
+            )
+            log_stats["clipfrac"].append(
+                torch.mean((torch.abs(ratio - 1.0) > clip_range).float()).detach()
+            )
+            # Pin first sample / first tstep of the tile for time-series
+            # alignment debugging across runs.
+            log_stats["log_prob_new_idx_0"].append(log_prob_new[0, 0].detach())
+            log_stats["log_prob_old_idx_0"].append(lpo_tile[0, 0].detach())
+            log_stats["log_prob_mean_abs_diff"].append(
+                torch.mean(torch.abs(log_prob_new - lpo_tile)).detach()
+            )
+
+        return loss
+
+
+def _chunked_indices(n: int, chunk: int, device: torch.device) -> list[torch.Tensor]:
+    """Split range(n) into 1-D LongTensor chunks of size <= ``chunk``.
+
+    Used to slice the (M, T_sde) train grid into tiles. Always returns at
+    least one chunk; the last chunk may be shorter when n % chunk != 0.
+    """
+    if n <= 0:
+        return []
+    chunk = max(1, chunk)
+    return [
+        torch.arange(start, min(start + chunk, n), device=device, dtype=torch.long)
+        for start in range(0, n, chunk)
+    ]
+
+
+def _slice_collated_cond(
+    cond: dict,
+    *,
+    s_idx: torch.Tensor,
+    k: int,
+    M_total: int,
+    use_cfg: bool,
+) -> dict:
+    """Slice a window-collated cond dict to a tile of shape (m*k, ...).
+
+    The collate is shape (M, ...) (no CFG) or (2M, ...) (CFG, packed
+    [pos | neg]). For each sample row picked by ``s_idx``, repeat that row
+    ``k`` times consecutively so the tile aligns with the (m, k) grid
+    flattened to (m*k, ...). For CFG, slice the pos and neg halves
+    independently and re-pack as [pos_mk | neg_mk] — the caller does the
+    matching ``torch.cat([h_pos_mk, h_neg_mk])``.
+
+    The slicing is dtype-agnostic; tensors keep their original dtype
+    (caller casts to compute dtype after slicing).
+    """
+    m = int(s_idx.numel())
+
+    def _slice_value(v, rows: torch.Tensor):
+        if isinstance(v, torch.Tensor):
+            return v.index_select(0, rows).repeat_interleave(k, dim=0)
+        if isinstance(v, list):
+            picked = [v[int(r)] for r in rows.tolist()]
+            return [x for x in picked for _ in range(k)]
+        # scalars / None / strings: pass through
+        return v
+
+    out: dict = {}
+    if use_cfg:
+        # rows in the pos half (0..M-1) and the neg half (M..2M-1).
+        s_idx_neg = s_idx + M_total
+        for key, v in cond.items():
+            pos_part = _slice_value(v, s_idx)
+            neg_part = _slice_value(v, s_idx_neg)
+            if isinstance(v, torch.Tensor):
+                out[key] = torch.cat([pos_part, neg_part], dim=0)
+            elif isinstance(v, list):
+                out[key] = pos_part + neg_part
+            else:
+                out[key] = v
+        return out
+
+    for key, v in cond.items():
+        out[key] = _slice_value(v, s_idx)
+    return out
+
+
+def _cast_cond_to_dtype(cond: dict, dtype: torch.dtype) -> dict:
+    """Cast floating-point tensors to the model's compute dtype; leave bool
+    masks / int / list / scalar values untouched. The bool
+    encoder_hidden_states_mask must NOT be cast — diffusers reads it as a
+    bool/int mask.
+    """
+    out: dict = {}
+    for k, v in cond.items():
+        if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+            out[k] = v.to(dtype)
+        else:
+            out[k] = v
+    return out
 
 
 @torch.no_grad()

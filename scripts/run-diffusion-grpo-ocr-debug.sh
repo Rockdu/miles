@@ -69,7 +69,9 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --rollout-batch-size 1 \
   --n-samples-per-prompt 8 \
   --num-rollout 100000 \
-  --diffusion-timestep-batch 10 \
+  --diffusion-train-sample-microbatch 1 \
+  --diffusion-train-tstep-microbatch 10 \
+  --diffusion-train-iter-order timestep_major \
   --gradient-checkpointing \
   --actor-num-gpus-per-node 2 \
   --rollout-num-gpus 2 \

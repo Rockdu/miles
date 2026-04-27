@@ -117,11 +117,46 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The backend for training.",
             )
             # Diffusion GRPO training knobs (used by DiffusionFSDPTrainRayActor).
+            #
+            # Per-optim-step the train loop sees an (M, T_sde) grid — M samples
+            # in this optim window × T_sde SDE timesteps per sample. The grid is
+            # processed as tiles of size (sample_microbatch, tstep_microbatch),
+            # gradients accumulating across tiles, optimizer steps once at the
+            # end of the window. Two extreme presets:
+            #
+            #   sample_microbatch = M, tstep_microbatch = 1, iter_order = sample_major
+            #     → outer loop over T_sde, inner forward = (M, 1, ...)
+            #     → memory peak ∝ M (the current default).
+            #
+            #   sample_microbatch = 1, tstep_microbatch = T_sde, iter_order = timestep_major
+            #     → outer loop over samples, inner forward = (1, T_sde, ...)
+            #     → memory peak ∝ T_sde (lower when M is the limit on 2-GPU runs).
+            #
+            # Loss scaling is uniform across plans: each tile's mean PPO loss is
+            # divided by total tile count, so net gradient = mean over (M, T_sde).
             parser.add_argument(
-                "--diffusion-timestep-batch",
+                "--diffusion-train-sample-microbatch",
+                type=int,
+                default=None,
+                help="Samples per DiT forward in train. None = full window (= num_microbatches).",
+            )
+            parser.add_argument(
+                "--diffusion-train-tstep-microbatch",
                 type=int,
                 default=1,
-                help="Number of timesteps to batch together in one DiT forward pass during training.",
+                help="SDE timesteps per DiT forward in train. Default 1.",
+            )
+            parser.add_argument(
+                "--diffusion-train-iter-order",
+                type=str,
+                choices=["sample_major", "timestep_major"],
+                default="sample_major",
+                help=(
+                    "Outer-loop axis when iterating tiles. sample_major: outer "
+                    "loop over timestep tiles (low memory when sample_microbatch "
+                    "is large). timestep_major: outer loop over sample tiles "
+                    "(low memory when tstep_microbatch is large)."
+                ),
             )
             parser.add_argument(
                 "--diffusion-clip-range",
