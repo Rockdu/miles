@@ -210,10 +210,18 @@ class FSDPTrainRayActor(TrainRayActor):
         return torch.device("cpu")
 
     def _gather_and_log_metrics(self, rollout_id: int, log_dict: dict[str, float], step: int) -> None:
-        """Reduce per-rank scalars and log."""
-        if "lr" not in log_dict and hasattr(self, "optimizer"):
+        """Reduce per-rank scalars and log.
+
+        ``train/lr`` and ``train/epoch`` are placed under the ``train/`` prefix
+        so wandb's ``define_metric("train/*", step_metric="train/step")`` puts
+        them in the same Charts row as the other train scalars, with x-axis =
+        ``train/step``. Logging them at root (``"lr"``, ``"epoch"``) would put
+        them in wandb's default "Charts" section against the auto-incrementing
+        internal commit step instead.
+        """
+        if "train/lr" not in log_dict and hasattr(self, "optimizer"):
             try:
-                log_dict["lr"] = float(self.optimizer.param_groups[0]["lr"])
+                log_dict["train/lr"] = float(self.optimizer.param_groups[0]["lr"])
             except Exception:
                 pass
         if self.parallel_state.dp_cp_rank == 0:
@@ -226,7 +234,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 group=self.parallel_state.dp_cp_group_gloo,
             )
             reduced = {k: sum(d[k] for d in gathered) / dp_size for k in log_dict}
-            reduced["epoch"] = float(rollout_id)
+            reduced["train/epoch"] = float(rollout_id)
             reduced["rollout/step"] = compute_rollout_step(self.args, rollout_id)
             # wandb.define_metric("train/*", step_metric="train/step") pulls the
             # x-axis value from this key; ``train/step`` subsumes what we used
@@ -239,7 +247,7 @@ class FSDPTrainRayActor(TrainRayActor):
             # don't get truncated to 0.0000 by a fixed-decimal format.
             print(
                 f"[train step {int(step)}] rollout={rollout_id} "
-                + " ".join(f"{k}={v:.6e}" for k, v in sorted(reduced.items()) if k not in ("epoch", "rollout/step", "train/step")),
+                + " ".join(f"{k}={v:.6e}" for k, v in sorted(reduced.items()) if k not in ("train/epoch", "rollout/step", "train/step")),
                 flush=True,
             )
         else:
