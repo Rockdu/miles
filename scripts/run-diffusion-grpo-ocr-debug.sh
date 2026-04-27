@@ -101,5 +101,6 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-height 256 \
   --diffusion-width 256 \
   --diffusion-debug-mode \
+  --update-weight-buffer-size 2147483648 \
   --debug-skip-optimizer-step \
   "${WANDB_ARGS[@]}"

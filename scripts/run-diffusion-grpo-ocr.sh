@@ -88,6 +88,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-sde-window-size 2 \
   --diffusion-sde-window-range 3,5 \
   --diffusion-true-onpolicy \
+  --update-weight-buffer-size 2147483648 \
   --diffusion-height 512 \
   --diffusion-width 512 \
   "${WANDB_ARGS[@]}"

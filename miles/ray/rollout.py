@@ -419,7 +419,13 @@ class RolloutManager:
 
     def _log_rollout_images(self, samples: list[Sample]) -> None:
         """Log a few rollout images to wandb under ``rollout/sample_images``.
-        Gated by ``--diffusion-log-images`` / ``--diffusion-log-image-interval``."""
+        Gated by ``--diffusion-log-images`` / ``--diffusion-log-image-interval``.
+
+        Same wandb.log pattern as flow_grpo's eval/sample image emission: pass
+        a list of ``wandb.Image`` to ``wandb.log`` together with the step
+        metric (``rollout/step``). wandb UI consolidates these into a single
+        media panel with a step slider, not one panel per emit.
+        """
         max_images = int(getattr(self.args, "diffusion_log_images", 0) or 0)
         if max_images <= 0:
             return
