@@ -9,18 +9,18 @@ SMOKE_COLOCATE="${SMOKE_COLOCATE:-1}"
 SMOKE_ACTOR_GPUS_PER_NODE="${SMOKE_ACTOR_GPUS_PER_NODE:-2}"
 SMOKE_ROLLOUT_GPUS="${SMOKE_ROLLOUT_GPUS:-2}"
 SMOKE_ROLLOUT_GPUS_PER_ENGINE="${SMOKE_ROLLOUT_GPUS_PER_ENGINE:-1}"
-SMOKE_PICKSCORE_NUM_WORKERS="${SMOKE_PICKSCORE_NUM_WORKERS:-1}"
-SMOKE_PICKSCORE_NUM_GPUS_PER_WORKER="${SMOKE_PICKSCORE_NUM_GPUS_PER_WORKER:-1.0}"
-SMOKE_PICKSCORE_BATCH_SIZE="${SMOKE_PICKSCORE_BATCH_SIZE:-2}"
+SMOKE_HPS_VERSION="${SMOKE_HPS_VERSION:-v2.1}"
+SMOKE_HPS_NUM_WORKERS="${SMOKE_HPS_NUM_WORKERS:-1}"
+SMOKE_HPS_BATCH_SIZE="${SMOKE_HPS_BATCH_SIZE:-8}"
 
 COLOCATE_ARGS=()
 if [[ "${SMOKE_COLOCATE}" == "1" || "${SMOKE_COLOCATE}" == "true" || "${SMOKE_COLOCATE}" == "yes" ]]; then
-  # Use two colocated train/rollout GPUs plus one dedicated PickScore reward GPU.
+  # Use two colocated train/rollout GPUs plus one dedicated HPS reward GPU.
   DEFAULT_CUDA_VISIBLE_DEVICES="4,5,6"
   DEFAULT_NUM_GPUS_PER_NODE="3"
   COLOCATE_ARGS+=(--colocate)
 else
-  # Use two train GPUs, two rollout GPUs, and one dedicated PickScore reward GPU.
+  # Use two train GPUs, two rollout GPUs, and one dedicated HPS reward GPU.
   DEFAULT_CUDA_VISIBLE_DEVICES="1,2,3,4,5"
   DEFAULT_NUM_GPUS_PER_NODE="5"
 fi
@@ -30,7 +30,7 @@ SMOKE_NUM_GPUS_PER_NODE="${SMOKE_NUM_GPUS_PER_NODE:-${DEFAULT_NUM_GPUS_PER_NODE}
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${DEFAULT_CUDA_VISIBLE_DEVICES}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-RUN_NAME="diffusion_grpo_pickscore_smoke_$(date +%Y%m%d_%H%M%S)"
+RUN_NAME="diffusion_grpo_hps_smoke_$(date +%Y%m%d_%H%M%S)"
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
@@ -72,20 +72,19 @@ fi
   --use-miles-router \
   --sglang-server-concurrency 2 \
   --diffusion-model Qwen/Qwen-Image \
-  --diffusion-reward pickscore:1.0 \
+  --diffusion-reward hps:1.0 \
   --advantage-estimator grpo \
   --globalize-reward-std \
-  --rm-type pickscore \
-  --pickscore-num-workers "${SMOKE_PICKSCORE_NUM_WORKERS}" \
-  --pickscore-num-gpus-per-worker "${SMOKE_PICKSCORE_NUM_GPUS_PER_WORKER}" \
-  --pickscore-batch-size "${SMOKE_PICKSCORE_BATCH_SIZE}" \
-  --pickscore-processor-path laion/CLIP-ViT-H-14-laion2B-s32B-b79K \
-  --pickscore-model-path yuvalkirstain/PickScore_v1 \
+  --rm-type hps \
+  --hps-version "${SMOKE_HPS_VERSION}" \
+  --hps-num-workers "${SMOKE_HPS_NUM_WORKERS}" \
+  --hps-num-gpus-per-worker 1 \
+  --hps-batch-size "${SMOKE_HPS_BATCH_SIZE}" \
   --diffusion-dtype bf16 \
   --diffusion-num-steps 10 \
   --diffusion-guidance-scale 4.0 \
   --diffusion-true-cfg-scale 4.0 \
-  --diffusion-rollout-noise-level 1.2 \
+  --diffusion-noise-level 1.2 \
   --diffusion-step-strategy-path miles.rollout.step_strategy_hub.sde_window \
   --diffusion-sde-window-size 2 \
   --diffusion-sde-window-range 0,5 \
@@ -93,6 +92,6 @@ fi
   --diffusion-width 256 \
   --global-batch-size 2 \
   --diffusion-ignore-last 1 \
-  --diffusion-rollout-debug-mode \
+  --diffusion-debug-mode \
   --debug-skip-optimizer-step \
   "${WANDB_ARGS[@]}"
