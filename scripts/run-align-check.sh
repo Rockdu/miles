@@ -17,6 +17,9 @@ USE_LORA="${USE_LORA-1}"                              # set to 0 to disable LoRA
 USE_GRAD_CKPT="${USE_GRAD_CKPT-1}"                    # set to 0 to disable gradient checkpointing
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE-32}"
 MICROGROUP_SIZE="${MICROGROUP_SIZE-1}"
+# microgroup batches same-prompt samples — n_samples_per_prompt must be >= mg
+# for the microgroup to actually run at batch=mg. Defaults to mg.
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT-${MICROGROUP_SIZE}}"
 TSTEP_MB="${TSTEP_MB-1}"
 SAMPLE_MB="${SAMPLE_MB-1}"
 LOAD_DUMP="${LOAD_DUMP:-}"                            # set to a path template to skip rollout
@@ -70,7 +73,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --prompt-data "${ROOT_DIR}/data/ocr/train.jsonl" \
   --input-key input \
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}" \
-  --n-samples-per-prompt 1 \
+  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}" \
   --num-rollout 1 \
   --diffusion-microgroup-size "${MICROGROUP_SIZE}" \
   --micro-batch-size-sample "${SAMPLE_MB}" \
