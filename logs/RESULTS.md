@@ -40,17 +40,13 @@
 | baseline_patch_off | OFF | gaussian r64 a128 | split | bf16 | 3.14e-02 | 8.46e-01 | 3.53e-02 | 9.65e-04 | 9.62e-04 |
 | fp32_patch_on     | ON | gaussian r64 a128 | split | fp32* | 5.16e-02 | 1.52e+00 | 6.19e-02 | 3.09e-03 | 3.04e-03 |
 | no_gc_patch_on    | ON | gaussian r64 a128 | split | bf16 | OOM | - | - | - | - |
-| cfg_joint_patch_on | ON | gaussian r64 a128 | joint | bf16 | crash† | - | - | - | - |
+| cfg_joint_patch_on | ON | gaussian r64 a128 | joint | bf16 | 2.54e-02 | 5.75e-01 | 2.86e-02 | 6.74e-04 | 6.73e-04 |
 
 \* fp32 train-side only. sgl-d rollout still loads `param_dtype: torch.bfloat16`
   regardless of `--diffusion-forward-dtype fp32` — this is the pre-existing
   miles/sglang-d miswiring; train↔rollout dtype mismatch is the source of the
   WORSE drift here, not the bf16 path noise per se.
 
-† joint CFG raises `Sizes of tensors must match except in dimension 0. Expected
-  size 35 but got size 6` when packing variable-length pos/neg encoder_hidden_states
-  along batch — `_pack_cond_for_joint_cfg` predates the v2 changes and never
-  handled the variable-text case. Split CFG (default) is unaffected.
 
 ## Findings
 
@@ -68,10 +64,12 @@
      so this needs an sgl-d-side fix to honor `--diffusion-forward-dtype fp32`).
    - Or, a kernel-level audit that finds another structural divergence in the
      bf16 path (less likely after the patch already covers RoPE + RMSNorm).
-4. **Joint CFG path is broken** for variable-length text — would need to pad
-   pos/neg encoder_hidden_states to a common max len before cat'ing in
-   `_pack_cond_for_joint_cfg`. Not tackled here (out of scope; split is
-   default and works).
+4. **Joint CFG ≈ Split CFG at this scale** — once the variable-length
+   pos/neg text bug was fixed (route joint forward through the padded
+   collate path, since the per-sample expand fast path skips padding),
+   joint produces noise_pred mean diff 2.54e-02 vs split's 2.51e-02 —
+   essentially identical, so the bf16 noise floor dominates over any
+   joint-vs-split kernel selection drift at Qwen-Image scale.
 
 ## Files changed (vs diffusion_RL_v0.1)
 - `miles/backends/fsdp_utils/actor.py`

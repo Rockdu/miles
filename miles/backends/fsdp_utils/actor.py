@@ -493,15 +493,21 @@ class FSDPTrainRayActor(TrainRayActor):
             rollout_model_outputs_window = None
 
         # Skip the (possibly NotImplementedError-raising) collate when no tile
-        # will ever have sample > 1: a model that only does timestep-only tiling
-        # then doesn't need to override collate_cond_for_sample_batch.
+        # will ever read grids["cond"]:
+        #   - tile_sample_count > 1   → reads cond via _tile_collated_cond
+        #   - joint CFG forward       → packs pos+neg along batch via
+        #     _pack_cond_for_joint_cfg, which requires pos/neg to be padded
+        #     to a common seq_len (collate's job). The per-sample expand path
+        #     keeps each sample's native seq_len so it can't feed joint CFG.
         local_batch_size = int(traj_end - traj_start)
         sample_microbatch_arg = getattr(self.args, "micro_batch_size_sample", None)
+        cfg_batching = use_cfg and bool(getattr(self.args, "fsdp_cfg_batching", False))
         needs_multi_sample_tile = (
             sample_microbatch_arg is None or sample_microbatch_arg > 1
         ) and local_batch_size > 1
+        needs_collated_cond = needs_multi_sample_tile or cfg_batching
 
-        if not needs_multi_sample_tile:
+        if not needs_collated_cond:
             cond_collated = None
         elif use_cfg:
             cond_collated = train_pipeline_config.collate_cond_for_sample_batch(
@@ -620,8 +626,11 @@ class FSDPTrainRayActor(TrainRayActor):
         timesteps_normalized = timesteps_flat / float(num_train_timesteps)
 
         # tile_sample==1: skip window-collated cond and use the per-sample
-        # un-padded cond + expand along tstep.
-        if tile_sample_count == 1:
+        # un-padded cond + expand along tstep. Exception: joint CFG packs
+        # pos+neg along batch and needs them padded to a common seq_len, so
+        # route through the collated path regardless of tile_sample.
+        cfg_batching = use_cfg and bool(getattr(self.args, "fsdp_cfg_batching", False))
+        if tile_sample_count == 1 and not cfg_batching:
             s = sample_indices.item()
             pos_cond_tile = train_pipeline_config.expand_cond_for_timestep_batch(
                 grids["per_sample_pos_cond"][s], tile_tstep_count
@@ -664,8 +673,6 @@ class FSDPTrainRayActor(TrainRayActor):
                 return_dict=False,
                 **cond,
             )[0]
-
-        cfg_batching = bool(getattr(self.args, "fsdp_cfg_batching", False))
 
         if not use_cfg:
             noise_pred_flat = _forward(pos_cond_tile)
