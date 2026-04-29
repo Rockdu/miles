@@ -151,6 +151,7 @@ def init_wandb_secondary(args, router_addr=None):
 def _init_wandb_common():
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("train/align/*", step_metric="train/step")
     # Also register deeper paths explicitly. A single ``rollout/*`` wildcard
     # is unreliable in wandb's multi-process shared mode: a 3-level key like
     # ``rollout/reward/raw_mean`` logged from the RolloutManager actor can
