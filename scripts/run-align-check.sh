@@ -15,6 +15,10 @@ APPLY_PATCH_FLAG="${APPLY_PATCH_FLAG---apply-qwen-image-sgl-d-patch}"
 CFG_BATCHING_FLAG="${CFG_BATCHING_FLAG-}"            # set to --fsdp-cfg-batching for joint
 USE_LORA="${USE_LORA-1}"                              # set to 0 to disable LoRA
 USE_GRAD_CKPT="${USE_GRAD_CKPT-1}"                    # set to 0 to disable gradient checkpointing
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE-32}"
+MICROGROUP_SIZE="${MICROGROUP_SIZE-1}"
+TSTEP_MB="${TSTEP_MB-1}"
+SAMPLE_MB="${SAMPLE_MB-1}"
 LOAD_DUMP="${LOAD_DUMP:-}"                            # set to a path template to skip rollout
 EXTRA_ARGS=(${EXTRA_ARGS:-})
 
@@ -65,12 +69,12 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --hf-checkpoint Qwen/Qwen-Image \
   --prompt-data "${ROOT_DIR}/data/ocr/train.jsonl" \
   --input-key input \
-  --rollout-batch-size 32 \
+  --rollout-batch-size "${ROLLOUT_BATCH_SIZE}" \
   --n-samples-per-prompt 1 \
   --num-rollout 1 \
-  --diffusion-microgroup-size 1 \
-  --micro-batch-size-sample 1 \
-  --micro-batch-size-tstep 1 \
+  --diffusion-microgroup-size "${MICROGROUP_SIZE}" \
+  --micro-batch-size-sample "${SAMPLE_MB}" \
+  --micro-batch-size-tstep "${TSTEP_MB}" \
   --diffusion-train-iter-order sample_major \
   --actor-num-gpus-per-node 1 \
   --rollout-num-gpus 1 \
