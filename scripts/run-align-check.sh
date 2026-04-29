@@ -87,6 +87,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --update-weight-buffer-size 2147483648 \
   --diffusion-model Qwen/Qwen-Image \
   --diffusion-reward ocr:1.0 \
+  --ocr-num-workers 1 \
   --advantage-estimator grpo \
   --globalize-reward-std \
   --rm-type ocr \

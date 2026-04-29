@@ -46,7 +46,7 @@ def _create_placement_group(num_gpus):
     actor (CPU=num_gpus_per_actor, typically 0.8) on the same bundle
     without the train actor pending forever on CPU starvation.
     """
-    bundles = [{"GPU": 1, "CPU": 4} for _ in range(num_gpus)]
+    bundles = [{"GPU": 1, "CPU": 16} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
