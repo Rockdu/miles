@@ -39,8 +39,14 @@ def sort_key(x):
 
 
 def _create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs."""
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
+    """Create a placement group with the specified number of GPUs.
+
+    Bundle CPU=4 (not 1) so colocated diffusion runs can fit the engine
+    actor (CPU=0.2), the RolloutManager router (CPU=0.2), and the train
+    actor (CPU=num_gpus_per_actor, typically 0.8) on the same bundle
+    without the train actor pending forever on CPU starvation.
+    """
+    bundles = [{"GPU": 1, "CPU": 4} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
