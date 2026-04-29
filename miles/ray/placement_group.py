@@ -250,8 +250,14 @@ def create_rollout_manager(args, pg):
                 placement_group_bundle_index=reordered_bundle_indices[0],
             )
 
+    # CPU=1 is fine when RM has its own bundle (non-diffusion or multi-GPU
+    # rollout) but starves the colocated diffusion engine on bundle 0
+    # (bundle CPU=1, engine wants 0.2). Drop to 0.2 in the colocated case.
+    rm_num_cpus = 0.2 if (
+        use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) <= 1
+    ) else 1
     rollout_manager = RolloutManager.options(
-        num_cpus=1,
+        num_cpus=rm_num_cpus,
         num_gpus=rm_num_gpus,
         scheduling_strategy=scheduling_strategy,
     ).remote(args, pg_tuple if use_diffusion_rollout else pg)
