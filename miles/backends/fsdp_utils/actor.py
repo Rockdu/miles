@@ -447,10 +447,11 @@ class FSDPTrainRayActor(TrainRayActor):
             log_prob_old = rollout_log_probs_list[traj_idx].to(device, dtype=torch.float32)
             advantage = advantages[traj_idx]
 
-            rdt = rollout_debug_tensors_list[traj_idx]
-            rmo = (
-                rdt.rollout_model_outputs.to(device, dtype=torch.float32)
-                if rdt is not None and rdt.rollout_model_outputs is not None
+            rollout_debug_tensors = rollout_debug_tensors_list[traj_idx]
+            rollout_model_outputs = (
+                rollout_debug_tensors.rollout_model_outputs.to(device, dtype=torch.float32)
+                if rollout_debug_tensors is not None
+                and rollout_debug_tensors.rollout_model_outputs is not None
                 else None
             )
 
@@ -462,8 +463,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 timesteps = timesteps[sde_indices_tensor]
                 log_prob_old = log_prob_old[sde_indices_tensor]
                 advantage = advantage[: sde_indices_tensor.numel()]
-                if rmo is not None:
-                    rmo = rmo[sde_indices_tensor]
+                if rollout_model_outputs is not None:
+                    rollout_model_outputs = rollout_model_outputs[sde_indices_tensor]
                 current_window_size = int(sde_indices_tensor.numel())
             else:
                 current_window_size = train_num_timesteps
@@ -480,7 +481,7 @@ class FSDPTrainRayActor(TrainRayActor):
             timesteps_list.append(timesteps)
             log_prob_old_list.append(log_prob_old)
             advantage_list.append(advantage)
-            rollout_model_outputs_list.append(rmo)
+            rollout_model_outputs_list.append(rollout_model_outputs)
 
         latents_window = torch.stack(latents_list, dim=0)
         next_latents_window = torch.stack(next_latents_list, dim=0)
@@ -492,13 +493,6 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             rollout_model_outputs_window = None
 
-        # Skip the (possibly NotImplementedError-raising) collate when no tile
-        # will ever read grids["cond"]:
-        #   - tile_sample_count > 1   → reads cond via _tile_collated_cond
-        #   - joint CFG forward       → packs pos+neg along batch via
-        #     _pack_cond_for_joint_cfg, which requires pos/neg to be padded
-        #     to a common seq_len (collate's job). The per-sample expand path
-        #     keeps each sample's native seq_len so it can't feed joint CFG.
         local_batch_size = int(traj_end - traj_start)
         sample_microbatch_arg = getattr(self.args, "micro_batch_size_sample", None)
         cfg_batching = use_cfg and bool(getattr(self.args, "fsdp_cfg_batching", False))
@@ -625,10 +619,8 @@ class FSDPTrainRayActor(TrainRayActor):
         # forward; diffusers' does not — pre-scale to match.
         timesteps_normalized = timesteps_flat / float(num_train_timesteps)
 
-        # tile_sample==1: skip window-collated cond and use the per-sample
-        # un-padded cond + expand along tstep. Exception: joint CFG packs
-        # pos+neg along batch and needs them padded to a common seq_len, so
-        # route through the collated path regardless of tile_sample.
+        # Joint CFG packs pos+neg along batch dim — needs collate's padding,
+        # so the per-sample expand fast path is only safe in the split case.
         cfg_batching = use_cfg and bool(getattr(self.args, "fsdp_cfg_batching", False))
         if tile_sample_count == 1 and not cfg_batching:
             s = sample_indices.item()
@@ -733,20 +725,23 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
             if grids.get("rollout_model_outputs") is not None:
-                rmo_tile = grids["rollout_model_outputs"][sample_indices][:, tstep_indices]
-                rmo_flat = rmo_tile.reshape(
-                    tile_sample_count * tile_tstep_count, *rmo_tile.shape[2:]
+                rollout_model_outputs_tile = grids["rollout_model_outputs"][sample_indices][:, tstep_indices]
+                rollout_model_outputs_flat = rollout_model_outputs_tile.reshape(
+                    tile_sample_count * tile_tstep_count, *rollout_model_outputs_tile.shape[2:]
                 )
-                np_train = noise_pred_flat.float()
-                np_rollout = rmo_flat.to(np_train.device, dtype=torch.float32)
-                diff = (np_train - np_rollout).abs()
+                noise_pred_train = noise_pred_flat.float()
+                noise_pred_rollout = rollout_model_outputs_flat.to(
+                    noise_pred_train.device, dtype=torch.float32
+                )
+                diff = (noise_pred_train - noise_pred_rollout).abs()
                 log_stats["align/noise_pred_abs_mean_diff"].append(diff.mean().detach())
                 log_stats["align/noise_pred_abs_max_diff"].append(diff.max().detach())
-                # Relative drift: ||train - rollout|| / ||rollout||
-                rollout_norm = np_rollout.norm()
+                rollout_norm = noise_pred_rollout.norm()
                 if rollout_norm > 0:
-                    rel = (np_train - np_rollout).norm() / rollout_norm
-                    log_stats["align/noise_pred_rel_l2_diff"].append(rel.detach())
+                    relative_l2_diff = (
+                        (noise_pred_train - noise_pred_rollout).norm() / rollout_norm
+                    )
+                    log_stats["align/noise_pred_rel_l2_diff"].append(relative_l2_diff.detach())
 
         return loss
 

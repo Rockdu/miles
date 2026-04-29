@@ -232,39 +232,33 @@ def create_training_models(args, pgs, rollout_manager):
 
 def create_rollout_manager(args, pg):
     use_diffusion_rollout = "diffusion_rollout" in args.rollout_function_path
-    # Diffusion RolloutManager is purely an orchestrator (router + http
-    # client); it never runs the DiT itself. Don't reserve a GPU slot
-    # for it — that would starve the engine actor on the same bundle when
-    # rollout_num_gpus == 1 (whole bundle gets consumed by the manager,
-    # engine.options(num_gpus=0.2) waits forever).
-    rm_num_gpus = 1 if (not use_diffusion_rollout) else 0
+    # Diffusion RolloutManager is a router/http-client only; reserving a GPU
+    # for it starves the colocated engine on the same bundle.
+    rollout_manager_num_gpus = 1 if (not use_diffusion_rollout) else 0
     logger.info(
         "Creating rollout manager (diffusion=%s, num_gpus=%s)",
         use_diffusion_rollout,
-        rm_num_gpus,
+        rollout_manager_num_gpus,
     )
     scheduling_strategy = None
     if use_diffusion_rollout:
         pg_tuple = pg
-        # Bind to bundle 0 for locality even when num_gpus=0, but only when
-        # the rollout PG has at least one bundle to bind to.
-        pg_obj, reordered_bundle_indices, _ = pg_tuple
+        placement_group_obj, reordered_bundle_indices, _ = pg_tuple
         if getattr(args, "rollout_num_gpus", 1) <= 1 and reordered_bundle_indices:
             scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg_obj,
+                placement_group=placement_group_obj,
                 placement_group_capture_child_tasks=True,
                 placement_group_bundle_index=reordered_bundle_indices[0],
             )
 
-    # CPU=1 is fine when RM has its own bundle (non-diffusion or multi-GPU
-    # rollout) but starves the colocated diffusion engine on bundle 0
-    # (bundle CPU=1, engine wants 0.2). Drop to 0.2 in the colocated case.
-    rm_num_cpus = 0.2 if (
+    # CPU=0.2 in the colocated case so the diffusion engine (CPU=0.2) on the
+    # same bundle (CPU=1) isn't starved.
+    rollout_manager_num_cpus = 0.2 if (
         use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) <= 1
     ) else 1
     rollout_manager = RolloutManager.options(
-        num_cpus=rm_num_cpus,
-        num_gpus=rm_num_gpus,
+        num_cpus=rollout_manager_num_cpus,
+        num_gpus=rollout_manager_num_gpus,
         scheduling_strategy=scheduling_strategy,
     ).remote(args, pg_tuple if use_diffusion_rollout else pg)
 

@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
-# Align-check fast launch: 32 prompts × 1 sample on a single GPU.
-# Purpose: collect train↔rollout noise_pred / log_prob diffs in one rollout
-# under frozen weights. Knobs (apply-qwen-image-sgl-d-patch, fsdp-cfg-batching,
-# sample-microbatch, etc.) can be flipped via env vars below.
-#
-# Outputs (under logs/$RUN_NAME):
-#   - rollout_dump_0.pt   per-sample debug dump (load via --load-debug-rollout-data
-#                          to skip rollout in subsequent training-only re-runs)
-#   - wandb run with train/align/* metrics
-
-# NOTE: do NOT pkill sgl/ray/python broadly here — this script may run on a
-# shared box where another rockdu training is using a different GPU. Rely on
-# CUDA_VISIBLE_DEVICES + a per-run RUN_NAME for isolation.
+# Align-check fast launch: 32 prompts × 1 sample on a single GPU, frozen
+# weights, --diffusion-debug-mode. Knobs via env vars below.
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
