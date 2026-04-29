@@ -9,11 +9,9 @@
 #                          to skip rollout in subsequent training-only re-runs)
 #   - wandb run with train/align/* metrics
 
-pkill -9 sgl_diffusion 2>/dev/null || true
-sleep 1
-ray stop --force 2>&1 | tail -1 || true
-pkill -9 -f "ray::" 2>/dev/null || true
-sleep 1
+# NOTE: do NOT pkill sgl/ray/python broadly here — this script may run on a
+# shared box where another rockdu training is using a different GPU. Rely on
+# CUDA_VISIBLE_DEVICES + a per-run RUN_NAME for isolation.
 
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
