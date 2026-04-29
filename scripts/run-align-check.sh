@@ -68,9 +68,9 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --rollout-batch-size 32 \
   --n-samples-per-prompt 1 \
   --num-rollout 1 \
-  --diffusion-microgroup-size 8 \
+  --diffusion-microgroup-size 1 \
   --micro-batch-size-sample 1 \
-  --micro-batch-size-tstep 10 \
+  --micro-batch-size-tstep 1 \
   --diffusion-train-iter-order sample_major \
   --actor-num-gpus-per-node 1 \
   --rollout-num-gpus 1 \
