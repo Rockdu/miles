@@ -22,10 +22,26 @@ SAVE_DIR="${ROOT_DIR}/logs/${RUN_NAME}"
 mkdir -p "${SAVE_DIR}"
 
 # Knobs (export to override before sourcing)
-APPLY_PATCH_FLAG="${APPLY_PATCH_FLAG:---apply-qwen-image-sgl-d-patch}"
-CFG_BATCHING_FLAG="${CFG_BATCHING_FLAG:-}"            # set to --fsdp-cfg-batching for joint
+APPLY_PATCH_FLAG="${APPLY_PATCH_FLAG---apply-qwen-image-sgl-d-patch}"
+CFG_BATCHING_FLAG="${CFG_BATCHING_FLAG-}"            # set to --fsdp-cfg-batching for joint
+USE_LORA="${USE_LORA-1}"                              # set to 0 to disable LoRA
+USE_GRAD_CKPT="${USE_GRAD_CKPT-1}"                    # set to 0 to disable gradient checkpointing
 LOAD_DUMP="${LOAD_DUMP:-}"                            # set to a path template to skip rollout
 EXTRA_ARGS=(${EXTRA_ARGS:-})
+
+LORA_FLAGS=()
+if [[ "${USE_LORA}" == "1" ]]; then
+  LORA_FLAGS=(
+    --use-lora
+    --lora-rank 64
+    --lora-alpha 128
+    --diffusion-init-lora-weight gaussian
+  )
+fi
+GC_FLAGS=()
+if [[ "${USE_GRAD_CKPT}" == "1" ]]; then
+  GC_FLAGS=(--gradient-checkpointing)
+fi
 
 WANDB_ARGS=()
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
@@ -67,16 +83,11 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --micro-batch-size-sample 1 \
   --micro-batch-size-tstep 10 \
   --diffusion-train-iter-order sample_major \
-  --gradient-checkpointing \
   --actor-num-gpus-per-node 1 \
   --rollout-num-gpus 1 \
   --rollout-num-gpus-per-engine 1 \
   --num-gpus-per-node 1 \
   --colocate \
-  --use-lora \
-  --lora-rank 64 \
-  --lora-alpha 128 \
-  --diffusion-init-lora-weight gaussian \
   --lr 0 \
   --adam-beta2 0.999 \
   --diffusion-clip-range 1e-4 \
@@ -103,6 +114,8 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-width 256 \
   ${APPLY_PATCH_FLAG} \
   ${CFG_BATCHING_FLAG} \
+  "${LORA_FLAGS[@]}" \
+  "${GC_FLAGS[@]}" \
   "${SAVE_FLAGS[@]}" \
   "${LOAD_FLAGS[@]}" \
   "${EXTRA_ARGS[@]}" \
