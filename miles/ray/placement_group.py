@@ -39,14 +39,8 @@ def sort_key(x):
 
 
 def _create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs.
-
-    Bundle CPU=4 (not 1) so colocated diffusion runs can fit the engine
-    actor (CPU=0.2), the RolloutManager router (CPU=0.2), and the train
-    actor (CPU=num_gpus_per_actor, typically 0.8) on the same bundle
-    without the train actor pending forever on CPU starvation.
-    """
-    bundles = [{"GPU": 1, "CPU": 16} for _ in range(num_gpus)]
+    """Create a placement group with the specified number of GPUs."""
+    bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -232,33 +226,28 @@ def create_training_models(args, pgs, rollout_manager):
 
 def create_rollout_manager(args, pg):
     use_diffusion_rollout = "diffusion_rollout" in args.rollout_function_path
-    # Diffusion RolloutManager is a router/http-client only; reserving a GPU
-    # for it starves the colocated engine on the same bundle.
-    rollout_manager_num_gpus = 1 if (not use_diffusion_rollout) else 0
     logger.info(
         "Creating rollout manager (diffusion=%s, num_gpus=%s)",
         use_diffusion_rollout,
-        rollout_manager_num_gpus,
+        0 if (use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) > 1) else (1 if use_diffusion_rollout else 0),
     )
     scheduling_strategy = None
     if use_diffusion_rollout:
         pg_tuple = pg
-        placement_group_obj, reordered_bundle_indices, _ = pg_tuple
-        if getattr(args, "rollout_num_gpus", 1) <= 1 and reordered_bundle_indices:
+        # If rollout uses multiple GPUs, do NOT bind RolloutManager to the rollout PG.
+        # Otherwise it consumes a GPU bundle and starves rollout workers.
+        if getattr(args, "rollout_num_gpus", 1) <= 1:
+            pg, reordered_bundle_indices, _ = pg_tuple
+            bundle_index = reordered_bundle_indices[0] if reordered_bundle_indices else 0
             scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=placement_group_obj,
+                placement_group=pg,
                 placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[0],
+                placement_group_bundle_index=bundle_index,
             )
 
-    # CPU=0.2 in the colocated case so the diffusion engine (CPU=0.2) on the
-    # same bundle (CPU=1) isn't starved.
-    rollout_manager_num_cpus = 0.2 if (
-        use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) <= 1
-    ) else 1
     rollout_manager = RolloutManager.options(
-        num_cpus=rollout_manager_num_cpus,
-        num_gpus=rollout_manager_num_gpus,
+        num_cpus=1,
+        num_gpus=0 if (use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) > 1) else (1 if use_diffusion_rollout else 0),
         scheduling_strategy=scheduling_strategy,
     ).remote(args, pg_tuple if use_diffusion_rollout else pg)
 
