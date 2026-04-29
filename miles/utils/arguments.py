@@ -1957,6 +1957,19 @@ def miles_validate_args(args):
         f"rollout_batch_size {args.rollout_batch_size}"
     )
 
+    if (
+        getattr(args, "diffusion_microgroup_size", None) is not None
+        and args.diffusion_microgroup_size > args.n_samples_per_prompt
+    ):
+        raise ValueError(
+            f"--diffusion-microgroup-size ({args.diffusion_microgroup_size}) > "
+            f"--n-samples-per-prompt ({args.n_samples_per_prompt}). microgroup batches "
+            f"same-prompt samples; the microgroup can never be filled past "
+            f"n_samples_per_prompt, so the rollout forward batch silently caps at "
+            f"n_samples_per_prompt and any align/throughput expectation tied to "
+            f"microgroup_size is wrong."
+        )
+
     if args.num_epoch is not None:
         if args.num_rollout is not None:
             logger.info("Both num_epoch and num_rollout are set, num_epoch will be ignored.")
