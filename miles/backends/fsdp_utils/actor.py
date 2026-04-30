@@ -1,4 +1,6 @@
+import contextlib
 import logging
+import os
 from argparse import Namespace
 from collections import defaultdict
 
@@ -42,6 +44,10 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.parallel_state = create_fsdp_parallel_state(args)
         torch.manual_seed(args.seed)
+        if os.environ.get("MILES_DETERMINISTIC", "").lower() in ("1", "true", "yes"):
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
         self.train_parallel_config = {
             "dp_size": self.parallel_state.dp_size,
@@ -557,6 +563,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
         log_stats: dict[str, list[torch.Tensor]] = defaultdict(list)
         skip_optimizer_step = bool(getattr(self.args, "debug_skip_optimizer_step", False))
+        forward_grad_ctx = (
+            torch.no_grad() if skip_optimizer_step else contextlib.nullcontext()
+        )
 
         for outer in outer_chunks:
             for inner in inner_chunks:
@@ -564,18 +573,19 @@ class FSDPTrainRayActor(TrainRayActor):
                     sample_indices, tstep_indices = inner, outer
                 else:
                     sample_indices, tstep_indices = outer, inner
-                loss = self._forward_tile(
-                    sample_indices=sample_indices,
-                    tstep_indices=tstep_indices,
-                    grids=grids,
-                    use_cfg=use_cfg,
-                    guidance_scale=guidance_scale,
-                    true_cfg_scale=true_cfg_scale,
-                    clip_range=clip_range,
-                    noise_level=noise_level,
-                    num_train_timesteps=num_train_timesteps,
-                    log_stats=log_stats,
-                )
+                with forward_grad_ctx:
+                    loss = self._forward_tile(
+                        sample_indices=sample_indices,
+                        tstep_indices=tstep_indices,
+                        grids=grids,
+                        use_cfg=use_cfg,
+                        guidance_scale=guidance_scale,
+                        true_cfg_scale=true_cfg_scale,
+                        clip_range=clip_range,
+                        noise_level=noise_level,
+                        num_train_timesteps=num_train_timesteps,
+                        log_stats=log_stats,
+                    )
                 if not skip_optimizer_step:
                     (loss / num_tiles).backward()
 

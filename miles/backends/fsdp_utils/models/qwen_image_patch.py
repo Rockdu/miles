@@ -200,6 +200,7 @@ def _patched_scale_residual_layernorm_scale_shift_forward(
 
 def apply_qwen_image_diffusers_parity_patches() -> None:
     """Install diffusers-parity forward replacements. Idempotent."""
+    import os
     from sglang.multimodal_gen.runtime.layers import layernorm as _layernorm_mod
     from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
     from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
@@ -209,6 +210,11 @@ def apply_qwen_image_diffusers_parity_patches() -> None:
         ScaleResidualLayerNormScaleShift,
     )
     from sglang.multimodal_gen.runtime.models.dits import qwen_image as _qi_mod
+
+    if os.environ.get("MILES_DETERMINISTIC", "").lower() in ("1", "true", "yes"):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     if getattr(RMSNorm, _PATCH_APPLIED_ATTR, False):
         return

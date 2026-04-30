@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Force deterministic cuBLAS workspace so train and rollout pick the same
+# GEMM algo at batch>=2 (different workspace sizes pick different kernels).
+export CUBLAS_WORKSPACE_CONFIG=":4096:8"
 RUN_NAME="${RUN_NAME:-align_check_$(date +%Y%m%d_%H%M%S)}"
 SAVE_DIR="${ROOT_DIR}/logs/${RUN_NAME}"
 mkdir -p "${SAVE_DIR}"
