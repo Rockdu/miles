@@ -49,6 +49,10 @@ class FSDPTrainRayActor(TrainRayActor):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
+        if os.environ.get("MILES_BLOCK_DUMP_DIR"):
+            from miles.backends.fsdp_utils.models.block_dump import register_diffusers_block_dump
+            register_diffusers_block_dump()
+
         self.train_parallel_config = {
             "dp_size": self.parallel_state.dp_size,
         }

@@ -216,6 +216,10 @@ def apply_qwen_image_diffusers_parity_patches() -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+    if os.environ.get("MILES_BLOCK_DUMP_DIR"):
+        from miles.backends.fsdp_utils.models.block_dump import register_sgld_block_dump
+        register_sgld_block_dump()
+
     if getattr(RMSNorm, _PATCH_APPLIED_ATTR, False):
         return
 
