@@ -198,6 +198,58 @@ def _patched_scale_residual_layernorm_scale_shift_forward(
     return normed * (1 + scale) + shift, residual_out
 
 
+def _install_input_cast_init_wrap(top_model_cls) -> None:
+    """Wrap ``__init__`` so each constructed instance gets a forward_pre_hook
+    that casts ``hidden_states`` and ``encoder_hidden_states`` to the model's
+    parameter dtype.
+
+    Why: when ``dit_precision=fp32`` but the text encoder still emits bf16,
+    sgl-d's first ``F.linear(bf16_input, fp32_weight)`` crashes with
+    ``mat1 and mat2 must have the same dtype``. Diffusers train side casts
+    cond inputs in ``_cast_cond_to_dtype`` before the forward; we need the
+    equivalent here. (Latents are also cast to be safe.)
+    """
+    if getattr(top_model_cls, "_miles_input_cast_installed", False):
+        return
+    original_init = top_model_cls.__init__
+
+    def _cast_pre_hook(module, args, kwargs):
+        try:
+            target_dtype = next(module.parameters()).dtype
+        except StopIteration:
+            return
+        h = kwargs.get("hidden_states") if "hidden_states" in kwargs else (
+            args[0] if args else None
+        )
+        if isinstance(h, torch.Tensor) and h.dtype != target_dtype and h.dtype.is_floating_point:
+            new_h = h.to(target_dtype)
+            if "hidden_states" in kwargs:
+                kwargs["hidden_states"] = new_h
+            else:
+                args = (new_h,) + args[1:]
+        e = kwargs.get("encoder_hidden_states")
+        if isinstance(e, torch.Tensor) and e.dtype != target_dtype and e.dtype.is_floating_point:
+            kwargs["encoder_hidden_states"] = e.to(target_dtype)
+        elif isinstance(e, list) and e and isinstance(e[0], torch.Tensor):
+            kwargs["encoder_hidden_states"] = [
+                x.to(target_dtype) if isinstance(x, torch.Tensor)
+                and x.dtype != target_dtype and x.dtype.is_floating_point
+                else x
+                for x in e
+            ]
+        return args, kwargs
+
+    def _wrapped_init(self, *a, **kw):
+        original_init(self, *a, **kw)
+        try:
+            self.register_forward_pre_hook(_cast_pre_hook, with_kwargs=True)
+        except Exception:
+            pass
+
+    top_model_cls.__init__ = _wrapped_init
+    top_model_cls._miles_input_cast_installed = True
+
+
 def apply_qwen_image_diffusers_parity_patches() -> None:
     """Install diffusers-parity forward replacements. Idempotent."""
     import os
@@ -215,6 +267,14 @@ def apply_qwen_image_diffusers_parity_patches() -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # Disable TF32 — at fp32 forward, TF32 cores still drop the matmul
+        # mantissa to 10 bits before accumulation, producing ~1e-2 abs diff
+        # per Linear at our shapes. Train and rollout can pick TF32 differently
+        # for the same Linear, so we need to force both off for bit-exact.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+    _install_input_cast_init_wrap(_qi_mod.QwenImageTransformer2DModel)
 
     if os.environ.get("MILES_BLOCK_DUMP_DIR"):
         from miles.backends.fsdp_utils.models.block_dump import register_sgld_block_dump

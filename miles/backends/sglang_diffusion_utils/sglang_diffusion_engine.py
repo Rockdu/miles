@@ -374,6 +374,10 @@ def _compute_server_args(args, host, port, nccl_port):
         "enable_cfg_parallel": args.sglang_enable_cfg_parallel,
         # Force-skip warmup to prevent warmup timeout during RL rollouts.
         "warmup": False,
+        # Mirror miles' DiT forward dtype to sgl-d's PipelineConfig.dit_precision
+        # so train and rollout DiT weights load at the same precision (default
+        # bf16, but fp32 needed for bit-exact align checks).
+        "dit_precision": getattr(args, "diffusion_forward_dtype", "bf16"),
     }
 
     # Forward every `args.sglang_<field>` the user set via --sglang-* CLI for

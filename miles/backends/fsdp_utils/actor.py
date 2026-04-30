@@ -48,6 +48,10 @@ class FSDPTrainRayActor(TrainRayActor):
             torch.use_deterministic_algorithms(True, warn_only=True)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
+            # Force off TF32 so fp32 matmuls actually use 23-bit mantissa
+            # accumulation. Otherwise per-op ~1e-2 train/rollout drift.
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
         if os.environ.get("MILES_BLOCK_DUMP_DIR"):
             from miles.backends.fsdp_utils.models.block_dump import register_diffusers_block_dump
