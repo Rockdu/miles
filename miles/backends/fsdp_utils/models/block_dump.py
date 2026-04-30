@@ -50,6 +50,8 @@ def _save_dump():
         "inputs": _state.get("inputs", []),
         "encoder_inputs": _state.get("encoder_inputs", []),
         "temb_inputs": _state.get("temb_inputs", []),
+        "raw_encoder": _state.get("raw_encoder"),
+        "raw_hidden": _state.get("raw_hidden"),
     }, p)
     _state["saved"] = True
     print(f"[block_dump:{side}] saved {len(_state['current'])} blocks → {p}", flush=True)
@@ -131,23 +133,55 @@ def finalize_after_forward(expected_block_count: int | None = None) -> None:
         _save_dump()
 
 
+def install_top_model_hook(top_model_cls, side: str | None = None) -> bool:
+    """Wrap top_model_cls.forward to capture initial encoder_hidden_states
+    BEFORE any txt_norm / txt_in processing. Stores in _state["raw_encoder"]."""
+    _maybe_init(side)
+    if _state["side"] is None:
+        return False
+    if getattr(top_model_cls, "_miles_top_dump_installed", False):
+        return True
+    original = top_model_cls.forward
+
+    def _wrapped(self, *args, **kwargs):
+        h = args[0] if args else kwargs.get("hidden_states")
+        e = kwargs.get("encoder_hidden_states")
+        if e is None and len(args) > 1:
+            e = args[1]
+        with _lock:
+            if not _state["saved"] and "raw_encoder" not in _state:
+                if isinstance(e, torch.Tensor):
+                    _state["raw_encoder"] = _peek_first_row(e)
+                if isinstance(h, torch.Tensor):
+                    _state["raw_hidden"] = _peek_first_row(h)
+        return original(self, *args, **kwargs)
+
+    top_model_cls.forward = _wrapped
+    top_model_cls._miles_top_dump_installed = True
+    return True
+
+
 def register_diffusers_block_dump():
-    """Train side: install hook on diffusers' QwenImageTransformerBlock."""
+    """Train side: install hook on diffusers' QwenImageTransformerBlock + top model."""
     try:
         from diffusers.models.transformers.transformer_qwenimage import (
             QwenImageTransformerBlock,
+            QwenImageTransformer2DModel,
         )
     except ImportError:
         return False
+    install_top_model_hook(QwenImageTransformer2DModel, side="train")
     return install_block_hook(QwenImageTransformerBlock, side="train")
 
 
 def register_sgld_block_dump():
-    """Rollout side: install hook on sglang-diffusion's QwenImageTransformerBlock."""
+    """Rollout side: install hook on sglang-diffusion's QwenImageTransformerBlock + top model."""
     try:
         from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
             QwenImageTransformerBlock,
+            QwenImageTransformer2DModel,
         )
     except ImportError:
         return False
+    install_top_model_hook(QwenImageTransformer2DModel, side="rollout")
     return install_block_hook(QwenImageTransformerBlock, side="rollout")

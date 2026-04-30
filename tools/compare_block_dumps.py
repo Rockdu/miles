@@ -23,6 +23,19 @@ def main():
     n = min(len(tb), len(rb))
     print(f"train blocks: {len(tb)}  rollout blocks: {len(rb)}  comparing first {n}")
     print(f"K (first values per block): {train['K']}")
+
+    re_t = train.get("raw_encoder")
+    re_r = rollout.get("raw_encoder")
+    if re_t is not None and re_r is not None:
+        d_re = (re_t - re_r).abs()
+        print(f"raw encoder_hidden_states (model entry, before txt_norm/txt_in): "
+              f"max_abs_diff={d_re.max().item():.3e} mean={d_re.mean().item():.3e}")
+    rh_t = train.get("raw_hidden")
+    rh_r = rollout.get("raw_hidden")
+    if rh_t is not None and rh_r is not None:
+        d_rh = (rh_t - rh_r).abs()
+        print(f"raw hidden_states (model entry, before img_in): "
+              f"max_abs_diff={d_rh.max().item():.3e} mean={d_rh.mean().item():.3e}")
     print()
     ti = train.get("inputs", [])
     ri = rollout.get("inputs", [])
