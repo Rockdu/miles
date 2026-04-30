@@ -48,6 +48,8 @@ def _save_dump():
         "K": K_PEEK,
         "blocks": _state["current"],
         "inputs": _state.get("inputs", []),
+        "encoder_inputs": _state.get("encoder_inputs", []),
+        "temb_inputs": _state.get("temb_inputs", []),
     }, p)
     _state["saved"] = True
     print(f"[block_dump:{side}] saved {len(_state['current'])} blocks → {p}", flush=True)
@@ -79,14 +81,25 @@ def install_block_hook(transformer_block_cls, side: str | None = None) -> bool:
     original_forward = transformer_block_cls.forward
 
     def _wrapped(self, *args, **kwargs):
-        # Capture input (hidden_states is first positional or keyword arg)
         h_in = args[0] if args else kwargs.get("hidden_states")
+        # Try to capture other inputs
+        e_in = (args[1] if len(args) > 1 else kwargs.get("encoder_hidden_states"))
+        # temb is named — look up by name
+        t_in = kwargs.get("temb")
+        if t_in is None and len(args) >= 4:
+            # diffusers signature: hidden_states, encoder_hidden_states, encoder_hidden_states_mask, temb, ...
+            t_in = args[3] if isinstance(args[3], torch.Tensor) else None
         with _lock:
-            if not _state["saved"] and isinstance(h_in, torch.Tensor):
-                if "inputs" not in _state:
-                    _state["inputs"] = []
-                if len(_state["inputs"]) < EXPECTED_BLOCKS:
+            if not _state["saved"]:
+                _state.setdefault("inputs", [])
+                _state.setdefault("encoder_inputs", [])
+                _state.setdefault("temb_inputs", [])
+                if len(_state["inputs"]) < EXPECTED_BLOCKS and isinstance(h_in, torch.Tensor):
                     _state["inputs"].append(_peek_first_row(h_in))
+                if len(_state["encoder_inputs"]) < EXPECTED_BLOCKS and isinstance(e_in, torch.Tensor):
+                    _state["encoder_inputs"].append(_peek_first_row(e_in))
+                if len(_state["temb_inputs"]) < EXPECTED_BLOCKS and isinstance(t_in, torch.Tensor):
+                    _state["temb_inputs"].append(_peek_first_row(t_in))
         out = original_forward(self, *args, **kwargs)
         with _lock:
             if not _state["saved"] and len(_state["current"]) < EXPECTED_BLOCKS:
