@@ -245,10 +245,14 @@ def create_rollout_manager(args, pg):
                 placement_group_bundle_index=bundle_index,
             )
 
+    # Don't bind RolloutManager to the PG: it doesn't run GPU work and
+    # binding it consumed the entire bundle's CPU + GPU slots, starving
+    # SGLangDiffusionEngine of resources and hanging init_rollout_engines
+    # forever in single-GPU align-check / debug runs. Match align-check-mode
+    # branch's behaviour: num_cpus=1, num_gpus=0, scheduling_strategy=None.
     rollout_manager = RolloutManager.options(
         num_cpus=1,
-        num_gpus=0 if (use_diffusion_rollout and getattr(args, "rollout_num_gpus", 1) > 1) else (1 if use_diffusion_rollout else 0),
-        scheduling_strategy=scheduling_strategy,
+        num_gpus=0,
     ).remote(args, pg_tuple if use_diffusion_rollout else pg)
 
     # calculate num_rollout from num_epoch

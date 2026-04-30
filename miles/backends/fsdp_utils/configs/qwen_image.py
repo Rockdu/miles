@@ -140,17 +140,32 @@ class QwenImageTrainPipelineConfig(TrainPipelineConfig):
             padded.append(enc)
         encoder_hidden_states = torch.cat(padded, dim=0).to(device)   # (M, max_len, D)
 
-        mask = (
-            torch.arange(max_len, device=device).unsqueeze(0)
-            < torch.tensor(seq_lens, device=device).unsqueeze(1)
-        )                                                              # (M, max_len) bool
+        # Only emit a mask when there's actual padding. With homogeneous
+        # microbatches (all seq_lens equal — see qwen_image_patch.py and
+        # the rollout's per-prompt batching), the mask would be all-True
+        # and merely flags the diffusers DiT-level forward to construct a
+        # non-None joint_attention_mask. SDPA called with even an all-True
+        # bool mask routes through a different bf16 round-off path than
+        # ``attn_mask=None`` — 1-ULP-per-element noise that compounds to
+        # ~1.2e-3 rel-mean drift per block vs sgld rollout (which always
+        # passes attn_mask=None). Skipping the mask when seq_lens are
+        # uniform aligns the train forward with the rollout path.
+        if min(seq_lens) == max_len:
+            mask = None
+        else:
+            mask = (
+                torch.arange(max_len, device=device).unsqueeze(0)
+                < torch.tensor(seq_lens, device=device).unsqueeze(1)
+            )                                                              # (M, max_len) bool
 
-        return {
+        out = {
             "encoder_hidden_states": encoder_hidden_states,
-            "encoder_hidden_states_mask": mask,
             "txt_seq_lens": seq_lens,
             "img_shapes": img_shapes,
         }
+        if mask is not None:
+            out["encoder_hidden_states_mask"] = mask
+        return out
 
     def cfg_combine(
         self,
