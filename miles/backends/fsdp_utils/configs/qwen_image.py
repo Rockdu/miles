@@ -140,17 +140,21 @@ class QwenImageTrainPipelineConfig(TrainPipelineConfig):
             padded.append(enc)
         encoder_hidden_states = torch.cat(padded, dim=0).to(device)   # (M, max_len, D)
 
-        mask = (
-            torch.arange(max_len, device=device).unsqueeze(0)
-            < torch.tensor(seq_lens, device=device).unsqueeze(1)
-        )                                                              # (M, max_len) bool
-
-        return {
+        out = {
             "encoder_hidden_states": encoder_hidden_states,
-            "encoder_hidden_states_mask": mask,
             "txt_seq_lens": seq_lens,
             "img_shapes": img_shapes,
         }
+        # Only emit a mask when there is real padding. An all-True mask still
+        # forces diffusers' attention dispatch to MEM_EFFICIENT (because mask
+        # is non-None), while rollout-side passes mask=None and gets FLASH,
+        # producing per-block bf16 drift that compounds to ~2.5e-2 noise_pred.
+        if any(L < max_len for L in seq_lens):
+            out["encoder_hidden_states_mask"] = (
+                torch.arange(max_len, device=device).unsqueeze(0)
+                < torch.tensor(seq_lens, device=device).unsqueeze(1)
+            )
+        return out
 
     def cfg_combine(
         self,

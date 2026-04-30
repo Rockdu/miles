@@ -52,6 +52,7 @@ def _save_dump():
         "temb_inputs": _state.get("temb_inputs", []),
         "raw_encoder": _state.get("raw_encoder"),
         "raw_hidden": _state.get("raw_hidden"),
+        "preblocks": _state.get("preblocks", {}),
     }, p)
     _state["saved"] = True
     print(f"[block_dump:{side}] saved {len(_state['current'])} blocks → {p}", flush=True)
@@ -161,6 +162,55 @@ def install_top_model_hook(top_model_cls, side: str | None = None) -> bool:
     return True
 
 
+_PRE_BLOCK_NAMES = ("txt_norm", "txt_in", "img_in", "time_text_embed")
+
+
+def _make_pre_block_hook(module_name: str):
+    def _hook(_mod, inputs, output):
+        with _lock:
+            if _state["saved"]:
+                return
+            preblocks = _state.setdefault("preblocks", {})
+            slot = preblocks.setdefault(module_name, {"in": None, "out": None})
+            if slot["in"] is None and inputs:
+                first = inputs[0]
+                if isinstance(first, torch.Tensor):
+                    slot["in"] = _peek_first_row(first)
+            if slot["out"] is None:
+                target = output[0] if isinstance(output, tuple) else output
+                if isinstance(target, torch.Tensor):
+                    slot["out"] = _peek_first_row(target)
+    return _hook
+
+
+def install_pre_block_module_hook(top_model_cls, side: str | None = None) -> bool:
+    """Wrap top_model_cls.__init__ so each constructed instance gets forward
+    hooks registered on its txt_norm/txt_in/img_in children. Avoids wrapping
+    the top forward (which breaks sgl-d) and avoids hooking RMSNorm/Linear at
+    the class level (would fire for many unrelated instances)."""
+    _maybe_init(side)
+    if _state["side"] is None:
+        return False
+    if getattr(top_model_cls, "_miles_pre_block_dump_installed", False):
+        return True
+    original_init = top_model_cls.__init__
+
+    def _wrapped_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        for name in _PRE_BLOCK_NAMES:
+            mod = getattr(self, name, None)
+            if mod is None:
+                continue
+            try:
+                mod.register_forward_hook(_make_pre_block_hook(name))
+            except Exception:
+                pass
+
+    top_model_cls.__init__ = _wrapped_init
+    top_model_cls._miles_pre_block_dump_installed = True
+    return True
+
+
 def register_diffusers_block_dump():
     """Train side: install hook on diffusers' QwenImageTransformerBlock + top model."""
     try:
@@ -171,18 +221,22 @@ def register_diffusers_block_dump():
     except ImportError:
         return False
     install_top_model_hook(QwenImageTransformer2DModel, side="train")
+    install_pre_block_module_hook(QwenImageTransformer2DModel, side="train")
     return install_block_hook(QwenImageTransformerBlock, side="train")
 
 
 def register_sgld_block_dump():
     """Rollout side: install hook on sglang-diffusion's QwenImageTransformerBlock.
-    NOTE: top model hook is omitted for rollout — wrapping the sgl-d top
+    NOTE: top forward hook is omitted for rollout — wrapping the sgl-d top
     transformer's forward triggers an internal sgl-d bug ('NoneType has no
-    is_contiguous'), so we only hook the per-block forward."""
+    is_contiguous'). We instead wrap __init__ to register instance-level
+    forward hooks on txt_norm/txt_in/img_in children."""
     try:
         from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+            QwenImageTransformer2DModel,
             QwenImageTransformerBlock,
         )
     except ImportError:
         return False
+    install_pre_block_module_hook(QwenImageTransformer2DModel, side="rollout")
     return install_block_hook(QwenImageTransformerBlock, side="rollout")

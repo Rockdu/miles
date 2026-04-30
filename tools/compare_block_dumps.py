@@ -36,6 +36,25 @@ def main():
         d_rh = (rh_t - rh_r).abs()
         print(f"raw hidden_states (model entry, before img_in): "
               f"max_abs_diff={d_rh.max().item():.3e} mean={d_rh.mean().item():.3e}")
+
+    pb_t = train.get("preblocks", {}) or {}
+    pb_r = rollout.get("preblocks", {}) or {}
+    if pb_t and pb_r:
+        print()
+        print("pre-block module hooks (input/output of txt_norm/txt_in/img_in):")
+        for name in ("txt_norm", "txt_in", "img_in", "time_text_embed"):
+            t_slot = pb_t.get(name)
+            r_slot = pb_r.get(name)
+            if not t_slot or not r_slot:
+                continue
+            t_in, t_out = t_slot.get("in"), t_slot.get("out")
+            r_in, r_out = r_slot.get("in"), r_slot.get("out")
+            if t_in is not None and r_in is not None:
+                d_in = (t_in - r_in).abs()
+                d_out = (t_out - r_out).abs() if (t_out is not None and r_out is not None) else None
+                print(f"  {name:>9}  in: max={d_in.max().item():.3e} mean={d_in.mean().item():.3e}"
+                      + (f"   out: max={d_out.max().item():.3e} mean={d_out.mean().item():.3e}"
+                         if d_out is not None else ""))
     print()
     ti = train.get("inputs", [])
     ri = rollout.get("inputs", [])
@@ -59,8 +78,8 @@ def main():
             marker += "  out:↑↑"
         print(f"{i:5d}  {im:9.2e}  {em:9.2e}  {tm:9.2e}  {m:9.2e}  {mn:9.2e}  {rn:11.2e}{marker}")
     print()
-    if first_div is not None:
-        print(f"first divergent block: {first_div}")
+    if first_div_out is not None:
+        print(f"first divergent block: {first_div_out}")
     else:
         print("all blocks bit-equal up to K_PEEK")
 
