@@ -175,13 +175,14 @@ def register_diffusers_block_dump():
 
 
 def register_sgld_block_dump():
-    """Rollout side: install hook on sglang-diffusion's QwenImageTransformerBlock + top model."""
+    """Rollout side: install hook on sglang-diffusion's QwenImageTransformerBlock.
+    NOTE: top model hook is omitted for rollout — wrapping the sgl-d top
+    transformer's forward triggers an internal sgl-d bug ('NoneType has no
+    is_contiguous'), so we only hook the per-block forward."""
     try:
         from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
             QwenImageTransformerBlock,
-            QwenImageTransformer2DModel,
         )
     except ImportError:
         return False
-    install_top_model_hook(QwenImageTransformer2DModel, side="rollout")
     return install_block_hook(QwenImageTransformerBlock, side="rollout")
