@@ -47,6 +47,7 @@ def _save_dump():
         "side": side,
         "K": K_PEEK,
         "blocks": _state["current"],
+        "inputs": _state.get("inputs", []),
     }, p)
     _state["saved"] = True
     print(f"[block_dump:{side}] saved {len(_state['current'])} blocks → {p}", flush=True)
@@ -78,6 +79,14 @@ def install_block_hook(transformer_block_cls, side: str | None = None) -> bool:
     original_forward = transformer_block_cls.forward
 
     def _wrapped(self, *args, **kwargs):
+        # Capture input (hidden_states is first positional or keyword arg)
+        h_in = args[0] if args else kwargs.get("hidden_states")
+        with _lock:
+            if not _state["saved"] and isinstance(h_in, torch.Tensor):
+                if "inputs" not in _state:
+                    _state["inputs"] = []
+                if len(_state["inputs"]) < EXPECTED_BLOCKS:
+                    _state["inputs"].append(_peek_first_row(h_in))
         out = original_forward(self, *args, **kwargs)
         with _lock:
             if not _state["saved"] and len(_state["current"]) < EXPECTED_BLOCKS:
