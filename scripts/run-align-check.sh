@@ -105,6 +105,7 @@ python -u "${ROOT_DIR}/train_diffusion.py" \
   --diffusion-forward-dtype bf16 \
   --diffusion-num-steps 10 \
   --diffusion-eval-num-steps 10 \
+  --diffusion-step-strategy-path miles.rollout.step_strategy_hub.all_but_last \
   --num-steps-per-rollout 1 \
   --diffusion-guidance-scale 4.0 \
   --diffusion-true-cfg-scale 4.0 \

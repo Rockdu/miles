@@ -14,6 +14,15 @@ import numpy as np
 from miles.utils.types import Sample
 
 
+def all_but_last(
+    args: Namespace, sample: Sample, num_steps: int, seed: int
+) -> tuple[list[int] | None, list[int] | None]:
+    """SDE on every step except the final one. The last denoising step is
+    degenerate (its noise_pred has aliasing with ``x_final``) and is skipped
+    both for loss/backprop and for align metrics."""
+    return list(range(num_steps - 1)), None
+
+
 def sde_window(
     args: Namespace, sample: Sample, num_steps: int, seed: int
 ) -> tuple[list[int] | None, list[int] | None]:
