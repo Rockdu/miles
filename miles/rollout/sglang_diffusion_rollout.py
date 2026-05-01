@@ -226,7 +226,7 @@ async def generate_and_rm_microgroup(
     # calculate the reward for the microgroup
     rewards = await batched_async_rm(args, microgroup)
     for sample, reward in zip(microgroup, rewards, strict=True):
-        sample.reward = reward
+        sample.reward = {"avg": float(reward), args.rm_type: float(reward)}
     return microgroup
 
 async def generate_and_rm_group(
@@ -250,7 +250,7 @@ async def generate_and_rm_group(
     if args.group_rm:
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
-            sample.reward = reward
+            sample.reward = {"avg": float(reward), args.rm_type: float(reward)}
 
     return group
 

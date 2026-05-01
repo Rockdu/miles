@@ -125,7 +125,7 @@ class SGLangDiffusionEngine(RayActor):
         else:
             self._init_normal(server_args_dict)
 
-    def _init_external(self, expect_server_args):
+    def _init_external(self, expect_server_args, external_engine_need_check_fields=None):
         logger.info(f"Use external SGLang-Diffusion engine (rank={self.rank}, expect_server_args={expect_server_args})")
 
         # TODO: miles diffusion support server args sanity check
@@ -140,6 +140,15 @@ class SGLangDiffusionEngine(RayActor):
             base_url=f"http://{self.server_host}:{self.server_port}",
             is_process_alive=lambda: True,
         )
+
+        if self.node_rank == 0 and self.router_ip and self.router_port:
+            if self.args.use_miles_router:
+                response = requests.post(
+                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}"
+                )
+                response.raise_for_status()
+            else:
+                logger.warning("Skipping external router add_worker: only miles_router is supported for now")
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
@@ -238,6 +247,23 @@ class SGLangDiffusionEngine(RayActor):
             payload["weight_version"] = weight_version
         return self._make_request(
             "update_weights_from_tensor",
+            payload,
+        )
+
+    def update_weights_from_disk(
+        self,
+        model_path: str,
+        target_modules: list[str] | None = None,
+        flush_cache: bool = True,
+    ):
+        payload = {
+            "model_path": model_path,
+            "flush_cache": flush_cache,
+        }
+        if target_modules is not None:
+            payload["target_modules"] = target_modules
+        return self._make_request(
+            "update_weights_from_disk",
             payload,
         )
 

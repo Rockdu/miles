@@ -524,18 +524,24 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         if all_rollout_engines[i] is not None:
             continue
 
-        num_gpus = 0.2
-        num_cpus = num_gpus
+        if args.rollout_external:
+            num_gpus = 0
+            num_cpus = 0.1
+        else:
+            num_gpus = 0.2
+            num_cpus = num_gpus
 
         # Get the base GPU ID from placement group
         base_gpu_id = int(reordered_gpu_ids[i * num_gpu_per_engine])
         print(f"[DEBUG] Engine {i}: base_gpu_id={base_gpu_id}, bundle_index={reordered_bundle_indices[i * num_gpu_per_engine]}", flush=True)
 
-        scheduling_strategy = PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=reordered_bundle_indices[i * num_gpu_per_engine],
-        )
+        scheduling_strategy = "DEFAULT"
+        if not args.rollout_external:
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=reordered_bundle_indices[i * num_gpu_per_engine],
+            )
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
             "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",

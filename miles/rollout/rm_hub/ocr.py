@@ -93,7 +93,13 @@ class AsyncOcrPool(metaclass=SingletonMeta):
         num_workers = int(getattr(args, "ocr_num_workers", 4) or 4)
         if num_workers <= 0:
             raise ValueError(f"ocr_num_workers must be > 0, got {num_workers}")
-        self._actors = [OcrRewardActor.options(num_cpus=1).remote(use_gpu=False) for _ in range(num_workers)]
+        self._actors = [
+            OcrRewardActor.options(
+                num_cpus=1,
+                scheduling_strategy="DEFAULT",
+            ).remote(use_gpu=False)
+            for _ in range(num_workers)
+        ]
         self._round_robin_index = 0
         logger.info("Initialized OCR reward actor pool with %d workers.", num_workers)
 
@@ -119,9 +125,12 @@ def _rgb_hwc_from_generated(sample: Sample) -> np.ndarray:
     t = sample.generated_output
     if t is None:
         raise ValueError("generated_output is None")
-    if t.ndim != 4:
-        raise ValueError(f"generated_output must be 4D [C, F, H, W], got {tuple(t.shape)}")
-    frame_chw = t[:, 0, :, :]
+    if t.ndim == 3:
+        frame_chw = t
+    elif t.ndim == 4:
+        frame_chw = t[:, 0, :, :]
+    else:
+        raise ValueError(f"generated_output must be 3D [C, H, W] or 4D [C, F, H, W], got {tuple(t.shape)}")
     hwc = frame_chw.numpy().transpose(1, 2, 0)
     if float(hwc.max()) <= 1.0 + 1e-3:
         out = np.round(hwc * 255.0).clip(0, 255).astype(np.uint8)

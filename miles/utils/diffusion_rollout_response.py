@@ -51,13 +51,20 @@ def _parse_cond_kwargs(
 ) -> CondKwargs | None:
     if not data:
         return None
+
+    def _tensor_list(value: Any) -> list[torch.Tensor | None]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [deserialize_func(x) for x in value]
+        return [deserialize_func(value)]
+
     return CondKwargs(
         txt_seq_lens=data.get("txt_seq_lens"),
-        freqs_cis=[deserialize_func(x) for x in data.get("freqs_cis", [])],
+        freqs_cis=_tensor_list(data.get("freqs_cis")),
         img_shapes=data.get("img_shapes"),
-        encoder_hidden_states=[
-            deserialize_func(x) for x in data.get("encoder_hidden_states", [])
-        ],
+        encoder_hidden_states=_tensor_list(data.get("encoder_hidden_states")),
+        pooled_projections=_tensor_list(data.get("pooled_projections")),
     )
 
 

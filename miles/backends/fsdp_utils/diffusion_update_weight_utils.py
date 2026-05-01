@@ -9,6 +9,7 @@ import ray
 import torch
 import torch.distributed as dist
 from ray.actor import ActorHandle
+from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor, Replicate
 
 try:
@@ -116,7 +117,8 @@ class DiffusionUpdateWeightFromTensor(DiffusionUpdateWeight):
                 self.tp_rank = dist.get_rank() - start_rank
 
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:
-        monkey_patch_torch_reductions()
+        if not self.args.rollout_external:
+            monkey_patch_torch_reductions()
         logger.info("Using flattened tensor bucket (diffusion updater)")
         target_module = self.target_module
         named_tensors_by_dtypes = {}
@@ -128,6 +130,11 @@ class DiffusionUpdateWeightFromTensor(DiffusionUpdateWeight):
 
         serialized_tensors = []
         for _dtype, named_tensors in named_tensors_by_dtypes.items():
+            if self.args.rollout_external:
+                named_tensors = [
+                    (name, tensor.detach().cpu().contiguous())
+                    for name, tensor in named_tensors
+                ]
             flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
             metadata = flattened_tensor_bucket.get_metadata()
             # sglang-d WeightsUpdater expects per-module keyed dicts when
@@ -198,6 +205,10 @@ class DiffusionUpdateWeightFromTensorLoRA(DiffusionUpdateWeightFromTensor):
     def update_weights(self):
         self.weight_version += 1
 
+        if self.args.rollout_external:
+            self._update_weights_from_disk()
+            return
+
         verify = os.environ.get("MILES_VERIFY_WEIGHT_SYNC", "").lower() in ("1", "true", "yes")
         verify_pairs: list[tuple[str, torch.Tensor]] = [] if verify else None
 
@@ -256,6 +267,58 @@ class DiffusionUpdateWeightFromTensorLoRA(DiffusionUpdateWeightFromTensor):
 
         if verify_pairs is not None:
             self._verify_weight_sync(verify_pairs)
+
+    def _update_weights_from_disk(self) -> None:
+        if dist.get_rank() != self._ipc_gather_src:
+            return
+
+        sync_root = os.path.join(
+            getattr(self.args, "save", None) or "/tmp/miles_sglang_weight_sync",
+            "sglang_weight_sync",
+            f"v{self.weight_version}",
+        )
+        module_dir = os.path.join(sync_root, self.target_module)
+        os.makedirs(module_dir, exist_ok=True)
+
+        state_dict: dict[str, torch.Tensor] = {}
+        for name, param in self.model.state_dict().items():
+            if "lora_" in name:
+                continue
+
+            param = param.cuda()
+            if isinstance(param, DTensor):
+                param = param.redistribute(
+                    placements=[Replicate()] * param.device_mesh.ndim,
+                    async_op=True,
+                ).to_local()
+
+            if name in self._lora_index:
+                A, B, s = self._lora_index[name]
+                delta = (self._gather_full(B.weight) @ self._gather_full(A.weight)) * s
+                param = param.wait() if hasattr(param, "wait") else param
+                param = param + delta.to(param.device, param.dtype)
+                del delta
+
+            sglang_d_param_name = name.replace(".base_layer", "")
+            if sglang_d_param_name.startswith("base_model.model."):
+                sglang_d_param_name = sglang_d_param_name[len("base_model.model."):]
+
+            param = param.wait() if hasattr(param, "wait") else param
+            state_dict[sglang_d_param_name] = param.detach().cpu().contiguous()
+
+        weight_path = os.path.join(module_dir, "model.safetensors")
+        save_file(state_dict, weight_path)
+        logger.info(
+            "External rollout weight sync v%s: saved %d tensors to %s",
+            self.weight_version,
+            len(state_dict),
+            weight_path,
+        )
+        ref = self._ipc_engine.update_weights_from_disk.remote(
+            model_path=sync_root,
+            target_modules=[self.target_module],
+        )
+        ray.get(ref)
 
     def _verify_weight_sync(self, pairs: list[tuple[str, torch.Tensor]]) -> None:
         """Compare our expected merged-transformer SHA-256 against the live
