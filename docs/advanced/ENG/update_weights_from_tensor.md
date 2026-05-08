@@ -1,4 +1,4 @@
-# Update weights from tensor
+# Miles-diffusion Weights Update
 
 miles-diffusion and sglang-d support two weight update modes:
 

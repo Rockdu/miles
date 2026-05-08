@@ -1,4 +1,4 @@
-# Update weights from tensor
+# Miles-Diffusion权重更新
 
 miles-diffusion 和 sglang-d 支持两种权重更新方式：
 
@@ -71,6 +71,7 @@ SGLang PR [#20464](https://github.com/sgl-project/sglang/pull/20464) 在 H200 �
 | 20G | 2 | 4.198 | 8.396 |
 
 (TODO: profiling on 2GPU and 4GPU)
+
 
 ## 参考
 
