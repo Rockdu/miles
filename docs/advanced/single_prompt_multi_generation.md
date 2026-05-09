@@ -4,10 +4,14 @@ Single-prompt multi-generation means generating multiple trajectories for the
 same prompt in one rollout group. In Miles Diffusion, this is both an algorithmic
 requirement and a performance knob:
 
-- Algorithmically, Miles Diffusion compares multiple sampled outputs within a
-  prompt group, so each prompt should have multiple sampled outputs.
-- System-wise, packing multiple samples from the same prompt into one SGLang-D
-  request can improve rollout throughput and reduce request overhead.
+- Algorithmically, GRPO-style RL needs multiple samples from the same prompt so
+  Miles Diffusion can compare rewards within that prompt group and compute a
+  group-relative advantage.
+- System-wise, Miles sends one same-prompt microgroup to SGLang-D with
+  `num_outputs_per_prompt=N`. SGLang-D text-encodes that prompt once, expands the
+  prompt conditioning to the latent batch in the fixed Qwen-Image path, and runs
+  the denoising timestep loop on the expanded batch. This removes repeated
+  encoder/request overhead and makes DiT forwards larger when memory allows.
 
 This document summarizes how miles-diffusion currently supports this path, what
 the main knobs mean, and what still needs validation before treating it as the
@@ -111,15 +115,17 @@ fixed and tune only `diffusion_microgroup_size`.
 ## Performance Expectations
 
 Single-prompt multi-generation is expected to help when rollout GPUs are
-under-utilized. It improves the rollout path by batching multiple same-prompt
-samples into one DiT denoising pass, instead of sending the same prompt as many
-independent single-output requests.
+under-utilized. In the SGLang-D path, Miles turns a microgroup into one request;
+SGLang-D creates `num_outputs_per_prompt` latent samples, reuses the text-encoder
+result and prompt conditioning for that prompt, and iterates the denoising
+timesteps over the expanded batch. With CFG, positive and negative branches are
+still separate, but each branch is batched across the microgroup.
 
 The expected benefits are:
 
 - fewer HTTP requests per rollout;
-- better rollout-side GPU utilization;
-- less duplicated prompt-conditioning overhead;
+- less duplicated text-encoder and prompt-conditioning work;
+- larger DiT forwards and better rollout-side GPU utilization;
 - higher samples-per-second when memory headroom is sufficient.
 
 The tradeoff is memory. Larger `diffusion_microgroup_size` increases the
@@ -140,8 +146,9 @@ sgl-project/sglang#21988
 ```
 
 That PR fixes the mismatch where latent samples are expanded for
-`num_outputs_per_prompt > 1`, but prompt and negative-prompt conditioning remain
-at the original prompt batch size.
+`num_outputs_per_prompt > 1`, but Qwen-Image prompt and negative-prompt
+conditioning remain at the original prompt batch size instead of being repeated
+to the expanded latent batch.
 
 Practical implication:
 
