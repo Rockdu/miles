@@ -37,6 +37,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_max_response_len: int = 32768
     lr: float = 2e-6
     wandb_project: str = "miles-vlm"
+    # Verify every weight transfer to the rollout engines (startup check plus a
+    # snapshot/reset/resend/compare cycle after every Nth rollout's update).
+    check_weight_update_interval: int = 1
 
 
 def prepare(args: ScriptArgs):
@@ -130,6 +133,13 @@ def execute(args: ScriptArgs):
         # B300 (sm103): flashinfer attention not yet supported for this path
         sglang_args += "--sglang-attention-backend trtllm_mha "
 
+    check_args = ""
+    if args.check_weight_update_interval:
+        check_args = (
+            "--check-weight-update-equal "
+            f"--check-weight-update-interval {args.check_weight_update_interval} "
+        )
+
     misc_args = (
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
@@ -152,6 +162,7 @@ def execute(args: ScriptArgs):
         f"{get_wandb_args(args)} "
         f"{perf_args} "
         f"{sglang_args} "
+        f"{check_args} "
         f"{misc_args} "
         f"{args.extra_args} "
     )

@@ -1566,6 +1566,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "by up to 1 ULP of the quantized dtype per side (compared in dequantized space).",
             )
             parser.add_argument(
+                "--check-weight-update-interval",
+                type=int,
+                default=None,
+                help="Also verify the weight transfer during training, every N rollouts: after "
+                "update_weights, snapshot the engine weights, reset them, re-send the same "
+                "megatron weights and compare against the snapshot. Catches non-deterministic "
+                "or partial transfers; costs one extra update_weights per checked rollout. "
+                "Requires --check-weight-update-equal.",
+            )
+            parser.add_argument(
                 "--env-report",
                 type=str,
                 default=os.environ.get("MILES_SCRIPT_ENV_REPORT", ""),

@@ -100,6 +100,24 @@ async def train(args):
         if args.offload_rollout:
             await rollout_manager.onload_weights.remote()
         await actor_model.update_weights()
+
+        if (
+            args.check_weight_update_equal
+            and args.check_weight_update_interval
+            and rollout_id % args.check_weight_update_interval == 0
+        ):
+            # Verify this rollout's transfer: capture what just landed in the engine,
+            # wipe it, re-send the same megatron weights, and demand equality.
+            await rollout_manager.check_weights.remote(action="snapshot")
+            await rollout_manager.check_weights.remote(action="reset_tensors")
+            await actor_model.update_weights()
+            await rollout_manager.check_weights.remote(
+                action="compare",
+                allow_quant_error=args.check_weight_update_allow_quant_error,
+                selector=args.check_weight_update_selector,
+                skip_list=args.check_weight_update_skip_list,
+            )
+
         if args.offload_rollout:
             await rollout_manager.onload_kv.remote()
 
