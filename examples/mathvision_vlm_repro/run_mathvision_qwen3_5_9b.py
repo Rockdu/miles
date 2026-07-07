@@ -28,7 +28,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     model_name: str = "Qwen3.5-9B"
     megatron_model_type: str = "qwen3.5-9B"
     num_gpus_per_node: int = 8
-    hardware: Literal["H200", "B200", "B300"] = "B300"
+    hardware: Literal["H200", "B200", "B300", "H100"] = "B300"
     extra_args: str = ""
     data_dir: str = "/root/datasets"
     model_dir: str = "/root/models"
@@ -40,6 +40,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Verify every weight transfer to the rollout engines (startup check plus a
     # snapshot/reset/resend/compare cycle after every Nth rollout's update).
     check_weight_update_interval: int = 1
+    # Move Adam state to CPU. Required when the Adam states cannot shard across
+    # DP (e.g. 2x80GB H100 -> TP2/DP1 leaves ~81GB/GPU for a 9B model); the
+    # 4-GPU H100 config (TP2/DP2, ~45GB/GPU) fits without it.
+    optimizer_cpu_offload: bool = False
 
 
 def prepare(args: ScriptArgs):
@@ -127,6 +131,12 @@ def execute(args: ScriptArgs):
         "--adam-beta1 0.9 "
         "--adam-beta2 0.98 "
     )
+    if args.optimizer_cpu_offload:
+        optimizer_args += (
+            "--optimizer-cpu-offload "
+            "--overlap-cpu-optimizer-d2h-h2d "
+            "--use-precision-aware-optimizer "
+        )
 
     sglang_args = "--rollout-num-gpus-per-engine 1 " "--sglang-mem-fraction-static 0.6 "
     if args.hardware == "B300":
@@ -176,6 +186,9 @@ def execute(args: ScriptArgs):
             # Freeze the vision tower (ViT + projector); consumed in
             # miles/backends/megatron_utils/model_provider.py::_apply_bridge_runtime_config
             "MILES_FREEZE_VISION_MODEL": "1",
+            # The H100 devbox holds 4 of the node's 8 GPUs; NVLS multicast fails
+            # on a partial NVSwitch domain, so force it off there.
+            **({"NCCL_NVLS_ENABLE": "0"} if args.hardware == "H100" else {}),
         },
         megatron_path=args.megatron_path,
     )

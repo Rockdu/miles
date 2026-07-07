@@ -23,6 +23,11 @@ only delays the blow-up; text-only models don't show it.
 export WANDB_API_KEY=...                               # optional, project miles-vlm
 python examples/mathvision_vlm_repro/run_mathvision_qwen3_5_9b.py
 # smoke test: --mode debug_minimal; control run: --rollout-max-response-len 16384
+
+# 4x H100 80GB (TP2/DP2):
+python examples/mathvision_vlm_repro/run_mathvision_qwen3_5_9b.py --hardware H100 --num-gpus-per-node 4
+# 2x H100 (TP2/DP1) additionally needs --optimizer-cpu-offload: without DP
+# sharding the 9B Adam states (~81GB/GPU) exceed the 80GB card.
 ```
 
 ## What to watch
