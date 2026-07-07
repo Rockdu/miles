@@ -2,6 +2,7 @@
 import argparse
 import inspect
 import logging
+import os
 from contextlib import nullcontext
 from typing import Literal
 
@@ -90,6 +91,14 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
         provider.moe_router_bias_update_rate = args.moe_router_bias_update_rate
     if getattr(args, "moe_aux_loss_coeff", None) is not None:
         provider.moe_aux_loss_coeff = args.moe_aux_loss_coeff
+
+    # VLM providers expose freeze switches that have no CLI flag; env-gate them so
+    # RL runs can freeze the vision tower (ViT + projector) without a code change.
+    if os.environ.get("MILES_FREEZE_VISION_MODEL") == "1":
+        for attr in ("freeze_vision_model", "freeze_vision_projection"):
+            if hasattr(provider, attr):
+                setattr(provider, attr, True)
+                logger.info(f"MILES_FREEZE_VISION_MODEL=1: set provider.{attr}=True")
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
