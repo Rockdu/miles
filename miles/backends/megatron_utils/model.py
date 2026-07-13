@@ -809,7 +809,10 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         with patch_megatron_model(model):
             # For LoRA models, merge_adapter_weights=True (default) merges
             # adapter weights into base weights for a standalone HF model.
-            bridge.save_hf_pretrained(model, path=path)
+            # strict=False: a training model built without optional HF modules
+            # (e.g. MTP when --enable-mtp-training is off) cannot yield their
+            # tensors; strict mode would drop every shard containing one.
+            bridge.save_hf_pretrained(model, path=path, strict=False)
 
         if should_log:
             logger.info(f"Successfully saved merged HuggingFace model to {path}")
