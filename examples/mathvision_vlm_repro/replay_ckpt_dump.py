@@ -134,6 +134,8 @@ def execute(args: ReplayArgs):
             f"--load-debug-rollout-data {out_dir}/rollout_{{rollout_id}}.pt "
             f"--dumper-dir {out_dir}/dumps "
             f"--dumper-fwd-only enable=true {filter_kv}"
+            "--dumper-source-patcher-config-train "
+            "examples/mathvision_vlm_repro/dump_patches/megatron_gdn.yaml "
             "--dumper-fwd-bwd enable=false "
             "--dumper-inference enable=false "
         )

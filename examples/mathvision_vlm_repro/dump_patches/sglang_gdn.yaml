@@ -1,0 +1,22 @@
+# Source-patcher config: sglang Qwen3.5 GDN dump points (prefill scoring side).
+# Names mirror megatron_gdn.yaml — the comparator pairs by name.
+# Anchors verified against installed sglang 0.5.15.dev24 (models/qwen3_5.py).
+patches:
+  - target: sglang.srt.models.qwen3_5.Qwen3_5LinearDecoderLayer.forward
+    edits:
+      - match: "hidden_states = self.linear_attn("
+        prepend: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated')"
+  - target: sglang.srt.models.qwen3_5.Qwen3_5GatedDeltaNet.forward
+    edits:
+      - match: "core_attn_out = self.attn("
+        prepend: |
+          dumper.dump('gdn_mixed_qkv', mixed_qkv, dims='t h[tp]')
+          dumper.dump('gdn_z', z, dims='t nh[tp] hd')
+          dumper.dump('gdn_b', b, dims='t nh[tp]')
+          dumper.dump('gdn_a', a, dims='t nh[tp]')
+      - match: "z_shape_og = z.shape"
+        prepend: "dumper.dump('gdn_core_attn_out', core_attn_out, dims='t nh[tp] hd')"
+      - match: "output, _ = self.out_proj(core_attn_out)"
+        prepend: "dumper.dump('gdn_post_norm', core_attn_out, dims='t h[tp]')"
+      - match: "return output"
+        prepend: "dumper.dump('gdn_output', output, dims='t h # tp:replicated')"

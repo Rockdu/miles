@@ -1,0 +1,27 @@
+# Source-patcher config: megatron-core native GDN (bridge path) dump points.
+# Names must mirror sglang_gdn.yaml exactly — the comparator pairs by name.
+# Semantic map: megatron gate/beta/alpha == sglang z/b/a; both sides dump the
+# PRE-conv qkv as gdn_mixed_qkv.
+# NOTE: match strings written against /root/Megatron-LM @ miles-main (2026-07);
+# the patcher fails loudly on a miss — re-anchor against the live source then.
+patches:
+  - target: megatron.core.transformer.transformer_layer.TransformerLayer._forward_attention
+    edits:
+      - match: "attention_output_with_bias = self.self_attention("
+        prepend: "dumper.dump('layer_input', hidden_states, dims='s b h # tp:replicated')"
+  - target: megatron.core.ssm.gated_delta_net.GatedDeltaNet.forward
+    edits:
+      - match: "qkv, gate, beta, alpha = torch.split("
+        prepend: "dumper.dump('gdn_qkvzba', qkvzba, dims='b s h[tp]')"
+      - match: "nvtx_range_push(suffix=\"conv1d\")"
+        prepend: |
+          dumper.dump('gdn_mixed_qkv', qkv, dims='b s h[tp]')
+          dumper.dump('gdn_z', gate, dims='b s nh[tp] hd')
+          dumper.dump('gdn_b', beta, dims='b s nh[tp]')
+          dumper.dump('gdn_a', alpha, dims='b s nh[tp]')
+      - match: "core_attn_out = rearrange(core_attn_out"
+        prepend: "dumper.dump('gdn_core_attn_out', core_attn_out, dims='b s nh[tp] hd')"
+      - match: "output, _ = self.out_proj("
+        prepend: "dumper.dump('gdn_post_norm', core_attn_out, dims='b s h[tp]')"
+      - match: "return output"
+        prepend: "dumper.dump('gdn_output', output, dims='b s h # tp:partial')"
