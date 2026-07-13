@@ -44,6 +44,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # DP (e.g. 2x80GB H100 -> TP2/DP1 leaves ~81GB/GPU for a 9B model); the
     # 4-GPU H100 config (TP2/DP2, ~45GB/GPU) fits without it.
     optimizer_cpu_offload: bool = False
+    # Checkpointing for post-hoc dump/replay analysis. Weights-only (no optim/rng)
+    # to keep each dist-ckpt ~20GB. save_on_diff_threshold arms per-step saves once
+    # the train/rollout logprob gap crosses it, bracketing the explosion window.
+    save_dir: str = ""
+    save_interval: int = 50
+    save_on_diff_threshold: float = 0.0
 
 
 def prepare(args: ScriptArgs):
@@ -74,6 +80,18 @@ def execute(args: ScriptArgs):
     debug = args.mode == "debug_minimal"
 
     ckpt_args = f"--hf-checkpoint {args.model_dir}/{args.model_name} "
+    if args.save_dir:
+        ckpt_args += (
+            f"--save {args.save_dir} "
+            f"--save-interval {args.save_interval} "
+            "--no-save-optim "
+            "--no-save-rng "
+        )
+        if args.save_on_diff_threshold:
+            ckpt_args += (
+                f"--save-on-diff-threshold {args.save_on_diff_threshold} "
+                "--save-on-diff-max-saves 15 "
+            )
 
     rollout_args = (
         f"--prompt-data {args.data_dir}/mathvision/train.parquet "

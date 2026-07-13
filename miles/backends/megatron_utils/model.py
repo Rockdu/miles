@@ -44,6 +44,9 @@ from .parallel import get_packed_seq_params
 
 logger = logging.getLogger(__name__)
 
+# Counter for --save-on-diff-threshold triggered checkpoints (per process).
+_diff_triggered_saves = 0
+
 
 from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 from .lora_utils import save_lora_checkpoint
@@ -703,6 +706,27 @@ def train(
                     role=role,
                     rank=parallel_state.intra_dp.rank,
                 )
+
+        # Diff-triggered checkpointing: once the train/rollout logprob gap crosses
+        # the threshold, persist weights every step (bracketing the explosion) up
+        # to a hard cap. The metric is all-reduced across dp*cp so every rank
+        # reaches the same decision; PP>1 is rejected at argument validation
+        # (non-last stages would see no metric and hang the save collective).
+        if (arm := args.save_on_diff_threshold) is not None and loss_dict:
+            global _diff_triggered_saves
+            diff_val = loss_dict.get("train_rollout_logprob_abs_diff")
+            if (
+                diff_val is not None
+                and diff_val >= arm
+                and _diff_triggered_saves < args.save_on_diff_max_saves
+            ):
+                _diff_triggered_saves += 1
+                if is_megatron_main_rank():
+                    logger.info(
+                        f"diff-triggered save {_diff_triggered_saves}/{args.save_on_diff_max_saves}: "
+                        f"train_rollout_logprob_abs_diff={diff_val:.4f} >= {arm}"
+                    )
+                save(rollout_id * num_steps_per_rollout + step_id, model, optimizer, opt_param_scheduler)
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:

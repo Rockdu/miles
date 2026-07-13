@@ -1576,6 +1576,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "Requires --check-weight-update-equal.",
             )
             parser.add_argument(
+                "--save-on-diff-threshold",
+                type=float,
+                default=None,
+                help="When train_rollout_logprob_abs_diff of a train step reaches this value, "
+                "save a checkpoint after every step (bracketing the divergence blow-up) "
+                "until --save-on-diff-max-saves is exhausted. Requires --save; PP must be 1.",
+            )
+            parser.add_argument(
+                "--save-on-diff-max-saves",
+                type=int,
+                default=15,
+                help="Hard cap on checkpoints written by --save-on-diff-threshold.",
+            )
+            parser.add_argument(
                 "--env-report",
                 type=str,
                 default=os.environ.get("MILES_SCRIPT_ENV_REPORT", ""),
@@ -2436,6 +2450,12 @@ def miles_validate_args(args):
     assert not (
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
     ), "sglang_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
+
+    if args.save_on_diff_threshold is not None:
+        assert args.save is not None, "--save-on-diff-threshold requires --save."
+        assert (
+            args.pipeline_model_parallel_size == 1
+        ), "--save-on-diff-threshold requires PP=1: non-last stages see no loss metrics and would hang the save collective."
 
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."
