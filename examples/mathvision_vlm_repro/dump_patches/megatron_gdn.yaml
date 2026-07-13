@@ -19,9 +19,9 @@ patches:
           dumper.dump('gdn_z', gate, dims='b s nh[tp] hd')
           dumper.dump('gdn_b', beta, dims='b s nh[tp]')
           dumper.dump('gdn_a', alpha, dims='b s nh[tp]')
-      - match: "core_attn_out = rearrange(core_attn_out"
+      - match: "norm_out = self._apply_gated_norm(core_attn_out, gate)"
         prepend: "dumper.dump('gdn_core_attn_out', core_attn_out, dims='b s nh[tp] hd')"
-      - match: "output, _ = self.out_proj("
-        prepend: "dumper.dump('gdn_post_norm', core_attn_out, dims='b s h[tp]')"
-      - match: "return output"
-        prepend: "dumper.dump('gdn_output', output, dims='b s h # tp:partial')"
+      - match: "out, out_bias = self.out_proj(norm_out)"
+        prepend: "dumper.dump('gdn_post_norm', norm_out, dims='s b h[tp]')"
+      - match: "return out, out_bias"
+        prepend: "dumper.dump('gdn_output', out, dims='s b h # tp:partial')"
