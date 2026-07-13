@@ -132,10 +132,11 @@ def execute(args: ReplayArgs):
         filter_kv = f"filter='{args.dumper_filter}' " if args.dumper_filter else ""
         phase_args = (
             f"--load-debug-rollout-data {out_dir}/rollout_{{rollout_id}}.pt "
+            "--dumper-enable "
             f"--dumper-dir {out_dir}/dumps "
             f"--dumper-fwd-only enable=true {filter_kv}"
             "--dumper-source-patcher-config-train "
-            "examples/mathvision_vlm_repro/dump_patches/megatron_gdn.yaml "
+            "/root/miles/examples/mathvision_vlm_repro/dump_patches/megatron_gdn.yaml "
             "--dumper-fwd-bwd enable=false "
             "--dumper-inference enable=false "
         )
@@ -150,7 +151,16 @@ def execute(args: ReplayArgs):
         config=args,
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=args.megatron_model_type,
-        extra_env_vars={"MILES_FREEZE_VISION_MODEL": "1"},
+        extra_env_vars={
+            "MILES_FREEZE_VISION_MODEL": "1",
+            # apply_source_patches() in the train actor reads the dumper config
+            # from env; the CLI flag alone does not reach it.
+            **(
+                {"DUMPER_SOURCE_PATCHER_CONFIG": "/root/miles/examples/mathvision_vlm_repro/dump_patches/megatron_gdn.yaml"}
+                if args.phase == "megatron_dump"
+                else {}
+            ),
+        },
         megatron_path=args.megatron_path,
     )
 
