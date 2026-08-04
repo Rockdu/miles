@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-checkpoint", required=True)
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--steps", type=int, default=1, help="forward passes to dump")
+    parser.add_argument("--seed", type=int, default=0, help="token seed; hold fixed to diff two runs")
     parser.add_argument("--attn-implementation", default="flash_attention_2")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--disable-fp32-master", dest="keep_fp32_master", action="store_false", default=True)
@@ -119,7 +120,10 @@ def main() -> None:
     )
 
     vocab = hf_config.get_text_config().vocab_size
-    input_ids = torch.randint(0, vocab, (1, args.seq_len), device="cuda")
+    # Seeded on CPU, then moved: two runs of this harness must see byte-identical tokens, or the
+    # per-tensor deltas between their dumps measure the inputs rather than the precision policy.
+    generator = torch.Generator().manual_seed(args.seed)
+    input_ids = torch.randint(0, vocab, (1, args.seq_len), generator=generator).cuda()
     position_ids = torch.arange(args.seq_len, device="cuda").unsqueeze(0)
 
     for step in range(args.steps):
