@@ -26,7 +26,52 @@ def maybe_register_module_dumper(model) -> None:
     if not dumper.may_enable or dumper._non_intrusives:
         return
     dumper.register_non_intrusive_dumper(model)
+    _register_compute_weight_dumper(model)
     _dump_module_structure(model)
+
+
+def _register_compute_weight_dumper(model, *, name_prefix: str = "weight_compute__") -> list:
+    """Record the dtype/shape of the weights each forward actually consumes.
+
+    Under ``MixedPrecisionPolicy(param_dtype=...)`` a parameter exists twice — the resident master
+    and the all-gathered compute copy — and only a **forward pre-hook** sees the second one: there
+    FSDP has already unsharded it into ``param_dtype``, as a plain full-shape tensor needing no
+    collective. One hook later the sharded master is back. So the read *site* matters more than the
+    read method, and ``named_parameters()`` outside the forward (what ``_dump_module_structure``
+    does) reports the master, which is not what the kernels multiplied.
+
+    Never call ``full_tensor()``/``redistribute()`` from in here: it is a collective that deadlocks
+    against FSDP's own all-gather, and would hand back the master anyway.
+
+    Dedups to once per ``dumper.step()`` — the same module is called once per micro-batch and the
+    weight does not change in between.
+    """
+    dumper = _dumper()
+    if not dumper.may_enable:
+        return []
+    handles, seen = [], {}
+
+    def make_hook(path):
+        def hook(module, _args):
+            step = dumper._state.step
+            for param_name, param in module.named_parameters(recurse=False):
+                fqn = f"{path}.{param_name}" if path else param_name
+                if seen.get(fqn) == step:
+                    continue
+                seen[fqn] = step
+                value = param.detach()
+                is_local_shard = hasattr(value, "to_local")
+                if is_local_shard:  # outside any FSDP unit: record the shard, never collectivize
+                    value = value.to_local()
+                dumper.dump(name_prefix + fqn, value, weight_is_local_shard=is_local_shard)
+            return None  # a pre-hook returning non-None REPLACES the forward args
+
+        return hook
+
+    for path, module in model.named_modules():
+        if next(module.named_parameters(recurse=False), None) is not None:
+            handles.append(module.register_forward_pre_hook(make_hook(path)))
+    return handles
 
 
 def maybe_dumper_step() -> None:
@@ -41,6 +86,11 @@ def _dump_module_structure(model, out_path=None) -> None:
 
     DTensor-safe: under FSDP2 a param's ``.shape`` is already the global shape, so the tree describes
     the unsharded model even though every rank only holds a shard.
+
+    Runs outside the forward, so the dtypes here are the **master** ones, not the dtypes the kernels
+    consumed — see ``_register_compute_weight_dumper`` for those. Reading this file as "the weights
+    the forward used" is wrong under mixed precision, and the answer even depends on when it ran:
+    params of FSDP units that do not reshard after forward report the gathered dtype afterwards.
     """
     import json
     from pathlib import Path
