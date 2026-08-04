@@ -22,6 +22,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from miles.backends.experimental.fsdp_utils.actor import apply_fsdp2
 from miles.backends.experimental.fsdp_utils.adaptations import (
     PrecisionPolicy,
+    PrecisionSpec,
     apply_class_patches,
     apply_fp32_master,
     apply_packing,
@@ -50,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     # Explore a policy the arch has no spec for yet; a finding here becomes a specs/<arch>.py hook.
     parser.add_argument("--gather-dtype", choices=["fp32", "bf16", "fp16"], default=None)
     parser.add_argument("--autocast-dtype", choices=["fp32", "bf16", "fp16", "none"], default=None)
+    parser.add_argument(
+        "--legacy-precision",
+        action="store_true",
+        help="reproduce the pre-precision-control behavior (FSDP input casts on, arch spec dropped), "
+        "so a dump of it can be diffed against the controlled run",
+    )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--backward", action="store_true", help="also run a backward, dumping grad dtypes")
     # Knobs the shared construction path reads but this harness does not vary.
@@ -82,6 +89,8 @@ def build_model(args, hf_config, mesh):
             sync_dtype_resolver=policy.sync_dtype_resolver,
         )
         policy = apply_precision_policy_hooks(base, hf_config, args)
+    if args.legacy_precision:
+        policy.precision_spec = PrecisionSpec()
     if policy.keep_fp32_master:
         model = apply_fp32_master(model, policy.sync_dtype_resolver)
     apply_post_load_fixups(model, hf_config, args.hf_checkpoint)
@@ -96,7 +105,7 @@ def build_model(args, hf_config, mesh):
         param_dtype=policy.param_dtype,
         reduce_dtype=policy.reduce_dtype,
         precision_spec=policy.precision_spec,
-        cast_forward_inputs=policy.autocast_dtype is None,
+        cast_forward_inputs=args.legacy_precision or policy.autocast_dtype is None,
     )
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
