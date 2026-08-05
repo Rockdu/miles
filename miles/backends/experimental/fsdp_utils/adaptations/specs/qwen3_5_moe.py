@@ -7,10 +7,12 @@
   ``_resolve_fp32_gather_precision``.
 """
 
+import functools
 from dataclasses import replace
 
 import torch
 
+from ..class_patches import ModelInstancePatchHook, register_model_instance_patch
 from ..packing.registry import PackingPatch, register_packing_patch
 from ..precision import PrecisionPolicyHook, register_precision_policy
 
@@ -61,6 +63,10 @@ def _resolve_precision(base_policy, hf_config, args):
         base_policy,
         param_dtype=torch.float32,
         autocast_dtype=torch.bfloat16,
+        # autocast owns the compute dtype: without this, FSDP re-promotes the activation stream to
+        # fp32 at every wrap-unit boundary and the norms/residual adds run on an fp32 stream the
+        # rollout engine never sees (measured: 527/1074 fp32 activations vs rollout's 0).
+        cast_forward_inputs=False,
         sync_dtype_resolver=_resolve_sync_dtype,
     )
 
@@ -75,5 +81,32 @@ def _resolve_sync_dtype(name: str, checkpoint_dtype: torch.dtype) -> torch.dtype
     return checkpoint_dtype
 
 
+def _apply_embed_compute_cast(model) -> bool:
+    """Pin the model's float input boundary to the compute dtype.
+
+    The token ids are ints, so the real float boundary is the embedding output — and ``F.embedding``
+    is not autocast-covered, so under fp32 gather it emits the fp32 master and seeds an fp32 stream
+    that ``Qwen3_5RMSNorm``'s ``type_as`` and every residual add then propagate end to end
+    (measured: 29 fp32 activation names with the boundary cast alone disabled). Casting the output
+    to bf16 is value-identical to what the rollout engine computes: bf16(master) is exactly the
+    rounding the bf16 weight sync applies before its own bf16 embedding lookup.
+    """
+    embed = model.get_input_embeddings()
+    if getattr(embed, "_gdn_compute_cast", False):
+        return False
+    orig_forward = embed.forward
+
+    @functools.wraps(orig_forward)
+    def forward(*args, **kwargs):
+        return orig_forward(*args, **kwargs).to(torch.bfloat16)
+
+    embed.forward = forward
+    embed._gdn_compute_cast = True
+    return True
+
+
 register_packing_patch(PackingPatch("gated_deltanet_packing", _applies, "config", _apply))
 register_precision_policy(PrecisionPolicyHook("gated_deltanet_fp32_gather", _precision_applies, _resolve_precision))
+register_model_instance_patch(
+    ModelInstancePatchHook("gated_deltanet_embed_compute_cast", _precision_applies, _apply_embed_compute_cast)
+)

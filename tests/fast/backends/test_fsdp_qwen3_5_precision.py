@@ -24,6 +24,8 @@ def test_default_is_fp32_gather_with_bf16_autocast():
     assert policy.param_dtype is torch.float32
     assert policy.autocast_dtype is torch.bfloat16
     assert policy.keep_fp32_master
+    # autocast owns compute: FSDP must not re-promote wrap-unit inputs to fp32
+    assert policy.cast_forward_inputs is False
 
 
 def test_sync_ships_a_log_fp32():
@@ -44,6 +46,47 @@ def test_fp16_falls_back_to_plain_policy():
     assert policy.param_dtype is torch.float16
     assert policy.autocast_dtype is None
     assert policy.sync_dtype_resolver is None
+    assert policy.cast_forward_inputs is True
+
+
+def test_embed_output_pinned_to_compute_dtype():
+    import torch.nn as nn
+
+    from miles.backends.experimental.fsdp_utils.adaptations.class_patches import apply_model_instance_patches
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8).to(torch.float32)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+    model = Tiny()
+    apply_model_instance_patches(model, QWEN3_5, _args())
+    out = model.embed(torch.tensor([1, 2, 3]))
+    assert out.dtype is torch.bfloat16
+    # idempotent: a second pass keeps a single cast
+    apply_model_instance_patches(model, QWEN3_5, _args())
+    assert model.embed(torch.tensor([1])).dtype is torch.bfloat16
+
+
+def test_embed_patch_skipped_for_fp16():
+    import torch.nn as nn
+
+    from miles.backends.experimental.fsdp_utils.adaptations.class_patches import apply_model_instance_patches
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8).to(torch.float16)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+    model = Tiny()
+    apply_model_instance_patches(model, QWEN3_5, _args(fp16=True))
+    assert model.embed(torch.tensor([1])).dtype is torch.float16
 
 
 def test_disabled_master_falls_back_to_plain_policy():

@@ -17,6 +17,10 @@ class PrecisionPolicy:
     keep_fp32_master: bool = True
     autocast_dtype: torch.dtype | None = None
     sync_dtype_resolver: Callable[[str, torch.dtype], torch.dtype] | None = None
+    # FSDP2 re-casts each wrap unit's inputs to param_dtype when True (the FSDP default). A policy
+    # whose autocast owns the compute dtype sets this False, or the boundary cast re-promotes the
+    # activation stream to the gather dtype between every pair of autocast ops.
+    cast_forward_inputs: bool = True
 
 
 @dataclass

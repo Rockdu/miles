@@ -153,6 +153,7 @@ class FSDPTrainRayActor(TrainRayActor):
             args=self.args,
             param_dtype=self.precision_policy.param_dtype,
             reduce_dtype=self.precision_policy.reduce_dtype,
+            cast_forward_inputs=self.precision_policy.cast_forward_inputs,
         )
 
         model = self._fsdp2_load_full_state_dict(
@@ -631,6 +632,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 args=self.args,
                 param_dtype=self.precision_policy.param_dtype,
                 reduce_dtype=self.precision_policy.reduce_dtype,
+                cast_forward_inputs=self.precision_policy.cast_forward_inputs,
             )
             ref_model = self._fsdp2_load_full_state_dict(
                 ref_model,
@@ -689,7 +691,7 @@ def move_torch_optimizer(optimizer, device):
     torch.cuda.synchronize()
 
 
-def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None, param_dtype=None, reduce_dtype=None):
+def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None, param_dtype=None, reduce_dtype=None, cast_forward_inputs=True):
     """Apply FSDP2 (fully_shard) to the model.
 
     ``cpu_offload`` offloads params/grads/optimizer to CPU (the optimizer step runs on CPU).
@@ -723,6 +725,7 @@ def apply_fsdp2(model, mesh=None, cpu_offload=False, args=None, param_dtype=None
         "mp_policy": MixedPrecisionPolicy(
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
+            cast_forward_inputs=cast_forward_inputs,
         ),
         "offload_policy": offload_policy,
         "mesh": mesh,
