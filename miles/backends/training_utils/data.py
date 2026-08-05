@@ -124,6 +124,7 @@ def get_batch(
     qkv_format: str = "thd",
     get_position_ids: bool = False,
     allgather_cp: bool = False,
+    mrope_position_fn=None,
 ) -> dict[str, torch.Tensor | list[torch.Tensor] | None]:
     """
     Generate a CP-ready micro-batch with packed sequence parameters.
@@ -272,13 +273,26 @@ def get_batch(
         return ids
 
     if get_position_ids:
+        mm_list = batch.get("multimodal_train_inputs")
         position_ids_list = []
-        for t in batch["unconcat_tokens"]:
-            seq_len = t.size(0)
-            pos_ids = torch.arange(seq_len, device=t.device, dtype=torch.long)
+        for i, t in enumerate(batch["unconcat_tokens"]):
+            pos_ids = mrope_position_fn(t, mm_list[i]) if mrope_position_fn is not None and mm_list else None
+            if pos_ids is None:
+                pos_ids = torch.arange(t.size(0), device=t.device, dtype=torch.long)
             position_ids_list.append(pos_ids)
 
-        batch["position_ids"] = _compute_transform_like_token_ids(position_ids_list)
+        if any(p.dim() == 2 for p in position_ids_list):
+            # M-RoPE rows; text-only samples broadcast their arange so every sample has equal rows
+            assert parallel_state.cp.size == 1, "M-RoPE positions do not support CP"
+            assert qkv_format == "thd", "M-RoPE positions are only wired for thd"
+            n_rows = max(p.size(0) for p in position_ids_list if p.dim() == 2)
+            rows = [p if p.dim() == 2 else p.unsqueeze(0).expand(n_rows, -1) for p in position_ids_list]
+            ids = torch.cat(rows, dim=1)
+            if pad != 0:
+                ids = F.pad(ids, (0, pad), value=0)
+            batch["position_ids"] = ids.unsqueeze(1)
+        else:
+            batch["position_ids"] = _compute_transform_like_token_ids(position_ids_list)
 
     if (witness_ids := batch.get("witness_ids")) is not None:
         batch["witness_ids"] = _compute_transform_like_token_ids(witness_ids)
@@ -332,6 +346,8 @@ def get_batch(
         for i, mm_input_dict in enumerate(multimodal_train_inputs):
             if mm_input_dict is not None:
                 for key, mm_tensor in mm_input_dict.items():
+                    if key == "mm_token_type_ids":
+                        continue  # consumed by mrope_position_fn; never a packed model input
                     if key.endswith("_positions"):
                         mm_tensor = mm_tensor + sample_offsets[i]
                     if key not in multimodal_data:

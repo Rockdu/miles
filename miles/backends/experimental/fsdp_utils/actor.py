@@ -104,6 +104,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof = TrainProfiler(args)
 
+        self.processor = None
         for i in range(dist.get_world_size()):
             if i == dist.get_rank():
                 self.hf_config = load_hf_config(self.args.hf_checkpoint)
@@ -370,6 +371,7 @@ class FSDPTrainRayActor(TrainRayActor):
                             self.args.data_pad_size_multiplier,
                             self.args.qkv_format,
                             get_position_ids=True,
+                            mrope_position_fn=self._mrope_positions if self.processor is not None else None,
                         )
 
                         model_args = self._get_model_inputs_args(batch)
@@ -488,6 +490,7 @@ class FSDPTrainRayActor(TrainRayActor):
                         self.args.data_pad_size_multiplier,
                         self.args.qkv_format,
                         get_position_ids=True,
+                        mrope_position_fn=self._mrope_positions if self.processor is not None else None,
                     )
 
                     log_dict = self._train_step(
@@ -644,11 +647,41 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             raise NotImplementedError(f"Loading from checkpoint file {ref_load_path} not yet implemented")
 
+    def _mrope_positions(self, tokens: torch.Tensor, mm_inputs: dict | None) -> torch.Tensor | None:
+        """Per-sample M-RoPE position rows [n_rows, T]; None falls back to the text arange.
+
+        The HF wrapper derives M-RoPE only when it sees mm_token_type_ids, which the packed
+        training path never forwards — so the rows are computed here per document and concatenated
+        by get_batch. Returns the 4-row form the model splits (text row + t/h/w rotary rows);
+        get_rope_index is config-driven tensor math and touches no parameters.
+        """
+        if mm_inputs is None or "mm_token_type_ids" not in mm_inputs:
+            return None
+        device = tokens.device
+        image_grid = mm_inputs.get("image_grid_thw")
+        video_grid = mm_inputs.get("video_grid_thw")
+        # mm_token_type_ids covers the prompt (built at prompt-processing time); the generated
+        # response is text, so extend with the text type id to the full training length.
+        type_ids = mm_inputs["mm_token_type_ids"].to(device)
+        if type_ids.size(1) < tokens.size(0):
+            type_ids = torch.cat([type_ids, type_ids.new_zeros(1, tokens.size(0) - type_ids.size(1))], dim=1)
+        mrope_rows, _ = self.model.model.get_rope_index(
+            tokens.unsqueeze(0),
+            image_grid_thw=image_grid.to(device) if image_grid is not None else None,
+            video_grid_thw=video_grid.to(device) if video_grid is not None else None,
+            mm_token_type_ids=type_ids,
+        )
+        # Row 0 is the text/document row the model splits off for masking and the GDN packing
+        # boundaries; rows 1:4 are the t/h/w rows the rotary embedding consumes.
+        text_row = torch.arange(tokens.size(0), device=device, dtype=mrope_rows.dtype).unsqueeze(0)
+        return torch.cat([text_row, mrope_rows[:, 0]], dim=0)
+
     def _get_model_inputs_args(self, batch: dict) -> dict:
         input_ids = batch["tokens"]
         position_ids = batch["position_ids"]
 
         if get_parallel_state().cp.size > 1:
+            assert position_ids.dim() == 2, "M-RoPE position ids do not support CP"
             # TODO: Pin ring_flash_attn for torch 2.11+ compatibility; keep this local import to unblock non-FSDP+CP paths.
             from ring_flash_attn import update_ring_flash_attn_params
 

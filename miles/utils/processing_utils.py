@@ -9,6 +9,7 @@ from typing import Any
 
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer as RawTokenizer
+import torch
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
 from miles.utils.hf_config import register_hf_config_aliases
@@ -140,8 +141,14 @@ def call_processor(processor, text, multimodal_inputs: dict | None = None):
 
 
 def extract_multimodal_train_inputs(processor_output: Mapping[str, Any]) -> dict[str, Any] | None:
-    excluded_keys = {"input_ids", "attention_mask", "mm_token_type_ids"}
-    return {key: value for key, value in processor_output.items() if key not in excluded_keys} or None
+    # mm_token_type_ids stays: training needs it to compute per-sample M-RoPE positions
+    # (get_batch drops it before the packed model inputs are assembled). It is emitted by the
+    # text pipeline (return_tensors=None) as a list, so tensorize it like every other train input.
+    excluded_keys = {"input_ids", "attention_mask"}
+    out = {key: value for key, value in processor_output.items() if key not in excluded_keys}
+    if "mm_token_type_ids" in out and not torch.is_tensor(out["mm_token_type_ids"]):
+        out["mm_token_type_ids"] = torch.as_tensor(out["mm_token_type_ids"], dtype=torch.long)
+    return out or None
 
 
 def load_processor(name_or_path: str, **kwargs):
