@@ -155,11 +155,12 @@ def test_packing_boundaries_cleared_on_single_doc_forward():
         m.causal_conv1d_fn = None
         m.chunk_gated_delta_rule = dense.torch_chunk_gated_delta_rule
         m.recurrent_gated_delta_rule = dense.torch_recurrent_gated_delta_rule
+        m.norm = dense.Qwen3_5RMSNormGated(config.linear_value_head_dim, eps=config.rms_norm_eps)
 
     packed_pos = torch.cat([torch.arange(8), torch.arange(8)]).unsqueeze(0)
     single_pos = torch.arange(8).unsqueeze(0)
     with torch.no_grad():
-        model(input_ids=torch.randint(0, 128, (1, 16)), position_ids=packed_pos)
+        model(input_ids=torch.randint(0, 128, (1, 16)), position_ids=packed_pos, use_cache=False)
         assert all(m._gdn_cu_seqlens is not None for m in gdn_modules), "packed forward must set boundaries"
-        model(input_ids=torch.randint(0, 128, (1, 8)), position_ids=single_pos)
+        model(input_ids=torch.randint(0, 128, (1, 8)), position_ids=single_pos, use_cache=False)
         assert all(m._gdn_cu_seqlens is None for m in gdn_modules), "single-doc forward must clear boundaries"
