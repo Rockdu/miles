@@ -149,6 +149,12 @@ def test_packing_boundaries_cleared_on_single_doc_forward():
     model = dense.Qwen3_5TextModel(config).eval()
     gdn_modules = [m for m in model.modules() if isinstance(m, dense.Qwen3_5GatedDeltaNet)]
     assert gdn_modules
+    # Pin the torch fallbacks so the test is CPU-deterministic regardless of which fast-path
+    # wheels the host carries; the assertions below are about the boundary attrs, not the kernels.
+    for m in gdn_modules:
+        m.causal_conv1d_fn = None
+        m.chunk_gated_delta_rule = dense.torch_chunk_gated_delta_rule
+        m.recurrent_gated_delta_rule = dense.torch_recurrent_gated_delta_rule
 
     packed_pos = torch.cat([torch.arange(8), torch.arange(8)]).unsqueeze(0)
     single_pos = torch.arange(8).unsqueeze(0)
