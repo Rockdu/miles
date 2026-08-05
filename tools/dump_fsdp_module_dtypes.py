@@ -59,8 +59,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--backward", action="store_true", help="also run a backward, dumping grad dtypes")
+    parser.add_argument(
+        "--true-on-policy-mode",
+        action="store_true",
+        help="exercise the arch's true-on-policy precision hook (e.g. qwen3.5 fp32 gather + bf16 autocast)",
+    )
     # Knobs the shared construction path reads but this harness does not vary.
-    parser.set_defaults(true_on_policy_mode=False, sglang_true_on_policy_contract=None, dp_replicate_size=1)
+    parser.set_defaults(sglang_true_on_policy_contract=None, dp_replicate_size=1)
     return parser.parse_args()
 
 
