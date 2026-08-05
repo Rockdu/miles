@@ -37,6 +37,9 @@ class FSDPArgs:
     fp16: bool = False
     keep_fp32_master: bool = True
 
+    # Comma-separated parameter-name prefixes to freeze, e.g. "model.visual." for the ViT.
+    freeze_param_prefixes: str | None = None
+
     # FSDP configuration
     fsdp_state_dict_cpu_offload: bool = True  # If True, offload full state dict to CPU during collection.
     fsdp_cpu_offload: bool = (

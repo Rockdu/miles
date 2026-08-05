@@ -143,6 +143,15 @@ class FSDPTrainRayActor(TrainRayActor):
         # post-load packing patches that need the instantiated model (NemotronH); no-op for archs that don't
         apply_packing(model, self.hf_config, "post_load")
 
+        if self.args.freeze_param_prefixes:
+            prefixes = tuple(x for x in self.args.freeze_param_prefixes.split(",") if x)
+            frozen = 0
+            for name, param in model.named_parameters():
+                if name.startswith(prefixes):
+                    param.requires_grad_(False)
+                    frozen += 1
+            logger.info(f"[fsdp] froze {frozen} params under prefixes {prefixes}")
+
         model.train()
 
         full_state = model.state_dict()
