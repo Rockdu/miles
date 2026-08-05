@@ -115,3 +115,45 @@ def test_packing_patch_covers_dense_qwen3_5():
     for cls_name in ("Qwen3_5GatedDeltaNet", "Qwen3_5DecoderLayer"):
         cls = getattr(dense, cls_name)
         assert getattr(cls.forward, "_gdn_packing", False), f"{cls_name} not patched"
+
+
+def test_packing_boundaries_cleared_on_single_doc_forward():
+    """A packed forward must not leave stale cu_seqlens/seq_idx behind for the next single-document
+    forward — the leftover length mismatch crashed the conv kernel live (v3 run, rollout 5)."""
+    import pytest
+    import torch
+
+    dense = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+
+    from miles.backends.experimental.fsdp_utils.models.qwen3_5_moe import apply_gateddeltanet_packing_patch
+
+    apply_gateddeltanet_packing_patch()
+
+    cfg_cls = dense.Qwen3_5TextConfig
+    config = cfg_cls(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        layer_types=["linear_attention", "full_attention"],
+        vocab_size=128,
+        max_position_embeddings=512,
+    )
+    model = dense.Qwen3_5TextModel(config).eval()
+    gdn_modules = [m for m in model.modules() if isinstance(m, dense.Qwen3_5GatedDeltaNet)]
+    assert gdn_modules
+
+    packed_pos = torch.cat([torch.arange(8), torch.arange(8)]).unsqueeze(0)
+    single_pos = torch.arange(8).unsqueeze(0)
+    with torch.no_grad():
+        model(input_ids=torch.randint(0, 128, (1, 16)), position_ids=packed_pos)
+        assert all(m._gdn_cu_seqlens is not None for m in gdn_modules), "packed forward must set boundaries"
+        model(input_ids=torch.randint(0, 128, (1, 8)), position_ids=single_pos)
+        assert all(m._gdn_cu_seqlens is None for m in gdn_modules), "single-doc forward must clear boundaries"

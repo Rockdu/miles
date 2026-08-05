@@ -8,11 +8,24 @@ backward. No-op outside THD packing.
 """
 
 import functools
+import inspect
 import logging
 
 from ..adaptations.packing.boundaries import packed_seq_context
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_kwarg(fn, key) -> bool:
+    """True when ``fn`` can take ``key`` — the torch fallbacks (no fla / no causal_conv1d installed)
+    do not, and blind injection turns a slow-but-working path into a TypeError."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True  # C/custom ops hide their signature; the fast-path kernels all accept these
+    if any(p.kind is p.VAR_KEYWORD for p in sig.parameters.values()):
+        return True
+    return key in sig.parameters
 
 
 def _inject_kwarg(fn, key, value):
@@ -50,6 +63,12 @@ def _patch_gdn_forward(gdn_cls):
             value = cu if key == "cu_seqlens" else si
             fn = getattr(self, attr, None)
             if fn is not None and value is not None:
+                if not _accepts_kwarg(fn, key):
+                    logger.warning(
+                        f"[fsdp] GDN packing: {attr} (torch fallback?) does not accept {key}; "
+                        "per-document state reset is DISABLED for it — install fla/causal-conv1d"
+                    )
+                    continue
                 saved[attr] = fn
                 setattr(self, attr, _inject_kwarg(fn, key, value))
         try:
@@ -70,11 +89,13 @@ def _patch_decoder_forward(dl_cls, gdn_cls):
     @functools.wraps(orig)
     def forward(self, *args, **kwargs):
         ctx = packed_seq_context(kwargs.get("position_ids"))
-        if ctx is not None:
-            for module in self.modules():
-                if isinstance(module, gdn_cls):
-                    module._gdn_cu_seqlens = ctx.cu_seqlens
-                    module._gdn_seq_idx = ctx.seq_idx
+        # Always assign, CLEARING on non-packed forwards: micro-batches alternate between packed
+        # rows and single-document rows, and a stale cu_seqlens/seq_idx from the previous packed
+        # forward crashes the conv kernel with a length mismatch (observed live at rollout 5).
+        for module in self.modules():
+            if isinstance(module, gdn_cls):
+                module._gdn_cu_seqlens = ctx.cu_seqlens if ctx is not None else None
+                module._gdn_seq_idx = ctx.seq_idx if ctx is not None else None
         return orig(self, *args, **kwargs)
 
     forward._gdn_packing = True
