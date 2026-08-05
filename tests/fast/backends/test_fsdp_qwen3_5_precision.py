@@ -99,3 +99,19 @@ def test_does_not_leak_to_other_archs():
     policy = resolve_precision_policy(SimpleNamespace(model_type="qwen3"), _args())
     assert policy.param_dtype is torch.bfloat16
     assert policy.autocast_dtype is None
+
+
+def test_packing_patch_covers_dense_qwen3_5():
+    """The dense arch lives in its own transformers module; the patch loop must include it.
+    Regression for the false-positive where the "applied" log fired off the moe/next classes
+    while dense stayed stock and leaked GDN state across packed documents."""
+    import pytest
+
+    dense = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+
+    from miles.backends.experimental.fsdp_utils.models.qwen3_5_moe import apply_gateddeltanet_packing_patch
+
+    apply_gateddeltanet_packing_patch()
+    for cls_name in ("Qwen3_5GatedDeltaNet", "Qwen3_5DecoderLayer"):
+        cls = getattr(dense, cls_name)
+        assert getattr(cls.forward, "_gdn_packing", False), f"{cls_name} not patched"

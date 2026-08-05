@@ -91,7 +91,10 @@ def _find_class(mod, suffix):
 def apply_gateddeltanet_packing_patch():
     """Patch every GatedDeltaNet hybrid arch present (idempotent). Returns True if anything was patched."""
     patched = False
-    for mod_name in ("qwen3_5_moe", "qwen3_next"):
+    # NOTE: dense qwen3_5 is its own transformers module with its own classes — omitting it here
+    # while _applies() still matches it made the "applied" log fire with the dense classes left
+    # stock, silently leaking GDN recurrence/conv state across packed documents under THD.
+    for mod_name in ("qwen3_5", "qwen3_5_moe", "qwen3_next"):
         try:
             mod = __import__(f"transformers.models.{mod_name}.modeling_{mod_name}", fromlist=["x"])
         except Exception:
