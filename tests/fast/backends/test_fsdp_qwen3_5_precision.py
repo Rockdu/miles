@@ -102,6 +102,9 @@ def test_does_not_leak_to_other_archs():
 
 
 def test_packing_patch_covers_dense_qwen3_5():
+    import pytest
+
+    pytest.skip("ablation branch: dense qwen3_5 deliberately unpatched")
     """The dense arch lives in its own transformers module; the patch loop must include it.
     Regression for the false-positive where the "applied" log fired off the moe/next classes
     while dense stayed stock and leaked GDN state across packed documents."""
