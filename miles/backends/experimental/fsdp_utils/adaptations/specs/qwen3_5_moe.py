@@ -5,9 +5,9 @@ Three hooks:
 * packing — a config-time packed-doc reset that feeds cu_seqlens to fla
   chunk/recurrent_gated_delta_rule and seq_idx to causal_conv1d_fn per packed document. Patches the
   DecoderLayer/GatedDeltaNet class forwards; kernel logic lives in ``models/qwen3_5_moe.py``.
-* precision (true-on-policy) — the qwen3-dense recipe: fp32 gather + bf16 autocast, plus an fp32
-  weight-sync override for ``A_log``. See ``_resolve_true_on_policy_precision`` for exactly which
-  train/rollout gaps this closes and which it leaves open.
+* precision (fp32 gather, arch default) — the qwen3-dense recipe: fp32 gather + bf16 autocast,
+  plus an fp32 weight-sync override for ``A_log``. See ``_resolve_fp32_gather_precision`` for
+  exactly which train/rollout gaps this closes and which it leaves open.
 * precision (embed) — pin the token embedding to the compute dtype whenever gather and compute
   disagree; composes with the hook above (registration order matters: this one reads the
   autocast/gather dtypes the previous hook decided).
@@ -37,11 +37,14 @@ def _apply():
     return apply_gateddeltanet_packing_patch()
 
 
-def _true_on_policy_applies(hf_config, args) -> bool:
-    return _applies(hf_config) and getattr(args, "true_on_policy_mode", False)
+def _fp32_gather_applies(hf_config, args) -> bool:
+    """Default-on for GDN archs. fp16 runs and runs that disabled the fp32 master keep the old
+    bf16-gather behavior instead of erroring: the recipe consumes the master, so without one (or
+    under fp16) there is nothing correct to gather."""
+    return _applies(hf_config) and not getattr(args, "fp16", False) and getattr(args, "keep_fp32_master", True)
 
 
-def _resolve_true_on_policy_precision(base_policy, hf_config, args):
+def _resolve_fp32_gather_precision(base_policy, hf_config, args):
     """The qwen3-dense precision recipe for GatedDeltaNet archs: fp32 gather + bf16 autocast.
 
     What this closes (all verified by measurement on Qwen3.5-4B, 2026-08-04):
@@ -62,11 +65,9 @@ def _resolve_true_on_policy_precision(base_policy, hf_config, args):
     qwen3.5 rollout contract on the sglang side (fp32 containers), as qwen3 dense's contract did.
 
     Costs mirror qwen3 dense: fp32 all-gather doubles param communication and unsharded memory.
+    This is the arch default (no flag): opting out means ``--fp16`` or ``--disable-fp32-master``,
+    both of which fall back to the plain bf16/fp16-gather policy.
     """
-    if getattr(args, "fp16", False):
-        raise ValueError("qwen3.5 fp32-gather precision requires bf16 training")
-    if not base_policy.keep_fp32_master:
-        raise ValueError("qwen3.5 fp32-gather precision requires fp32 master weights")
     return replace(
         base_policy,
         param_dtype=torch.float32,
@@ -109,8 +110,8 @@ def _resolve_precision(base_policy, hf_config, args):
 
 
 register_packing_patch(PackingPatch("gated_deltanet_packing", _applies, "config", _apply))
-# Order matters: the true-on-policy hook decides gather/autocast dtypes; the embed hook reads them.
+# Order matters: the fp32-gather hook decides gather/autocast dtypes; the embed hook reads them.
 register_precision_policy(
-    PrecisionPolicyHook("gated_deltanet_true_on_policy", _true_on_policy_applies, _resolve_true_on_policy_precision)
+    PrecisionPolicyHook("gated_deltanet_fp32_gather", _fp32_gather_applies, _resolve_fp32_gather_precision)
 )
 register_precision_policy(PrecisionPolicyHook("gated_deltanet_embed_gather", _precision_applies, _resolve_precision))

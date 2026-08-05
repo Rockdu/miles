@@ -94,6 +94,13 @@ def build_model(args, hf_config, mesh):
             sync_dtype_resolver=policy.sync_dtype_resolver,
         )
         policy = apply_precision_policy_hooks(base, hf_config, args)
+        # Explicit overrides are the measurement knob, so they win over any arch-default recipe the
+        # hooks re-applied (e.g. qwen3.5's fp32 gather). A leftover embed rule compiles to zero
+        # extra wrap units when compute==gather, so it stays harmless under any re-asserted combo.
+        if args.gather_dtype:
+            policy.param_dtype = resolve_dtype(args.gather_dtype)
+        if args.autocast_dtype:
+            policy.autocast_dtype = None if args.autocast_dtype == "none" else resolve_dtype(args.autocast_dtype)
     if args.legacy_precision:
         policy.precision_spec = PrecisionSpec()
     if policy.keep_fp32_master:
