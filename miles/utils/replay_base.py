@@ -19,7 +19,7 @@ class Replay:
         self.top_indices_list: list[torch.Tensor] = []
 
     def record(self, top_indices: torch.Tensor):
-        buf = torch.empty_like(top_indices, device="cpu", pin_memory=True)
+        buf = torch.empty_like(top_indices, device="cpu", pin_memory=torch.cuda.is_available())
         buf.copy_(top_indices)
         self.top_indices_list.append(buf)
 
@@ -34,12 +34,12 @@ class Replay:
             )
         top_indices = self.top_indices_list[self.forward_index]
         self.forward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(torch.cuda.current_device()) if torch.cuda.is_available() else top_indices
 
     def pop_backward(self) -> torch.Tensor:
         top_indices = self.top_indices_list[self.backward_index]
         self.backward_index += 1
-        return top_indices.to(torch.cuda.current_device())
+        return top_indices.to(torch.cuda.current_device()) if torch.cuda.is_available() else top_indices
 
     def clear(self):
         self.forward_index = 0

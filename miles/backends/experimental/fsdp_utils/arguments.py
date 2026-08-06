@@ -49,6 +49,7 @@ class FSDPArgs:
     dp_replicate_size: int = 1
 
     deterministic_mode: bool = False  # This name must be the same as Megatron's
+    sequence_parallel: bool = False  # FSDP has no TP sequence parallelism; read by shared training_utils code
 
     # Context Parallelism
     context_parallel_size: int = 1  # Context Parallelism size

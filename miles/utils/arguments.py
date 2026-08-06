@@ -2610,6 +2610,12 @@ def parse_args(add_custom_arguments=None):
         args.world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
 
         assert args.context_parallel_size == 1, "Context parallelism is not supported for FSDP backend."
+        assert not (
+            args.use_routing_replay or args.use_indexer_replay or args.use_rollout_indexer_replay
+        ), "Only --use-rollout-routing-replay is implemented for the FSDP backend."
+        if args.use_rollout_routing_replay:
+            # the rollout-side routed-experts parser reshapes by args.num_layers (a Megatron arg)
+            args.num_layers = load_hf_config(args.hf_checkpoint).num_hidden_layers
 
     # On iff the CI harness injected MILES_CI_GATE_RECORD_DIR (the same env var
     # locates the per-test record). No CLI flag: non-CI runs always stay False.

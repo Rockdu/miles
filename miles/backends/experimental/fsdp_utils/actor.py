@@ -23,6 +23,7 @@ from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils.tracking import init_tracking
 
 from ....utils.profile_utils import TrainProfiler
+from ....utils.replay_base import routing_replay_manager
 from ...training_utils.ci_utils import check_grad_norm
 from ...training_utils.data import DataIterator, get_batch, get_data_iterator, get_rollout_data
 from ...training_utils.log_utils import (
@@ -33,12 +34,14 @@ from ...training_utils.log_utils import (
 )
 from ...training_utils.loss import compute_advantages_and_returns, get_log_probs_and_entropy, loss_function
 from ...training_utils.parallel import get_parallel_state, set_parallel_state
+from ...training_utils.replay_data import fill_replay_data, register_replay_list_sequential
 from . import checkpoint
 from .adaptations.class_patches import apply_class_patches, apply_model_instance_patches
 from .adaptations.packing import apply_packing
 from .adaptations.post_load_fixups import apply_post_load_fixups
 from .adaptations.precision import apply_fp32_master, precision_forward_context, resolve_precision_policy
 from .lr_scheduler import get_lr_scheduler
+from .models.glm4_moe_lite import apply_routing_replay_patch
 from .parallel import create_fsdp_parallel_state
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
@@ -133,6 +136,11 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
         apply_model_instance_patches(model, self.hf_config, self.args)
+        if self.args.use_rollout_routing_replay:
+            # enabled must be set before registration: register_to_module no-ops on a disabled manager
+            routing_replay_manager.enabled = True
+            routing_replay_manager.register_replay_list_func = register_replay_list_sequential
+            apply_routing_replay_patch(model, self.hf_config)
         if self.precision_policy.keep_fp32_master:
             model = apply_fp32_master(model, self.precision_policy.sync_dtype_resolver)
 
@@ -448,12 +456,31 @@ class FSDPTrainRayActor(TrainRayActor):
             len(num_microbatches) > 0
         ), f"Invalid num_microbatches {num_microbatches} for micro_batch_size {self.args.micro_batch_size} and global_batch_size {self.args.global_batch_size}"
 
+        if self.args.use_rollout_routing_replay:
+            fill_replay_data(
+                args=self.args,
+                models=[self.model],
+                data_iterator=[data_iterator],
+                num_microbatches=num_microbatches,
+                rollout_data=rollout_data,
+                data_key=routing_replay_manager.data_key,
+                replay_list=routing_replay_manager.replays,
+                register_replay_list_func=routing_replay_manager.register_replay_list_func,
+                if_sp_region=routing_replay_manager.if_sp_region,
+            )
+
         if self.ref_model is not None:
+            if self.args.use_rollout_routing_replay:
+                routing_replay_manager.stage = "fallthrough"
             ref_results = self._compute_log_prob("ref", data_iterator, num_microbatches, store_prefix="ref_")
             rollout_data.update(ref_results)
 
+        if self.args.use_rollout_routing_replay:
+            routing_replay_manager.stage = "replay_forward"
         actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
         rollout_data.update(actor_results)
+        if self.args.use_rollout_routing_replay:
+            routing_replay_manager.clear_all_forward()
 
         compute_advantages_and_returns(self.args, rollout_data)
 
@@ -532,6 +559,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.prof.step(rollout_id=rollout_id)
 
+        if self.args.use_rollout_routing_replay:
+            routing_replay_manager.clear_all()
+
         if self.args.save_debug_train_data is not None:
             train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
@@ -560,7 +590,13 @@ class FSDPTrainRayActor(TrainRayActor):
             apply_megatron_loss_scaling=False,
         )
 
+        # gradient-checkpoint recompute re-runs the routers inside backward; replay_backward
+        # pops an independent cursor over the same per-microbatch streams
+        if self.args.use_rollout_routing_replay:
+            routing_replay_manager.stage = "replay_backward"
         loss.backward()
+        if self.args.use_rollout_routing_replay:
+            routing_replay_manager.stage = "replay_forward"
 
         return log_dict
 
