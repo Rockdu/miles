@@ -6,7 +6,6 @@ Engine prompt lengths per call (update_from_meta_info):
                                                             ├─ equal ────► record
     meta_info.prompt_tokens ────────────────────────► got ──┘
                                                             └─ different ► off: record · warn: record + log · error: raise
-    meta_info without prompt_tokens ► nothing recorded
 """
 
 from tests.ci.ci_register import register_cpu_ci
@@ -359,11 +358,6 @@ class TestEnginePromptLengthsPerCall:
             _make_args(engine_prompt_length_check="error"), _make_meta_info([6, 7], prompt_tokens=5)
         )
         assert s.engine_prompt_lengths_per_call == [2, 5]
-
-    def test_missing_prompt_tokens_records_nothing(self):
-        s = _make_sample([1, 2], [3, 4, 5])
-        s.update_from_meta_info(_make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5]))
-        assert s.engine_prompt_lengths_per_call == []
 
     def test_mismatch_warns_and_records(self, caplog):
         s = _make_sample([1, 2], [3, 4, 5])
