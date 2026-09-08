@@ -162,9 +162,6 @@ def get_batch(
     if "dynamic_global_batch_size" in data_iterator.rollout_data:
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
-    # No-op safety net if batches reach get_batch without rollout-level preprocessing.
-    expand_multimodal_rollout_data_in_place(batch, qkv_format=qkv_format)
-
     tokens = batch["tokens"]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
