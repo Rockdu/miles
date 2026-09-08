@@ -53,17 +53,6 @@ def get_rollout_data(
     rollout_data["loss_masks"] = [
         torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
     ]
-    if "rollout_mask_sums" in rollout_data:
-        rollout_data["rollout_mask_sums"] = torch.tensor(
-            rollout_data["rollout_mask_sums"], dtype=torch.float32, device=torch.cuda.current_device()
-        )
-    if args.enable_witness:
-        seq_witness_ids = rollout_data.pop("seq_witness_ids")
-        rollout_data["witness_ids"] = [
-            torch.full((len(t),), fill_value=sid, dtype=torch.long, device=torch.cuda.current_device())
-            for t, sid in zip(rollout_data["tokens"], seq_witness_ids, strict=True)
-        ]
-
     if "multimodal_train_inputs" in rollout_data:
         # Move multimodal training tensors to GPU in advance
         rollout_data["multimodal_train_inputs"] = [
@@ -73,6 +62,19 @@ def get_rollout_data(
                 else None
             )
             for mm_dict in rollout_data["multimodal_train_inputs"]
+        ]
+    # everything below derives lengths from tokens, so expand media placeholders first
+    expand_multimodal_rollout_data_in_place(rollout_data)
+
+    if "rollout_mask_sums" in rollout_data:
+        rollout_data["rollout_mask_sums"] = torch.tensor(
+            rollout_data["rollout_mask_sums"], dtype=torch.float32, device=torch.cuda.current_device()
+        )
+    if args.enable_witness:
+        seq_witness_ids = rollout_data.pop("seq_witness_ids")
+        rollout_data["witness_ids"] = [
+            torch.full((len(t),), fill_value=sid, dtype=torch.long, device=torch.cuda.current_device())
+            for t, sid in zip(rollout_data["tokens"], seq_witness_ids, strict=True)
         ]
 
     if args.qkv_format == "bshd":
@@ -437,8 +439,6 @@ def get_data_iterator(
     - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
     - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
     """
-    expand_multimodal_rollout_data_in_place(rollout_data, qkv_format=args.qkv_format)
-
     parallel_state = get_parallel_state()
 
     if "micro_batch_indices" in rollout_data:

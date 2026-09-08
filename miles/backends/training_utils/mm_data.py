@@ -15,7 +15,6 @@ import torch
 from miles.utils.media_expansion import INKLING_AUDIO_SENTINEL_ID, INKLING_IMAGE_SENTINEL_ID
 from miles.utils.types import RolloutBatch
 
-from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp
 from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
@@ -34,9 +33,9 @@ def _expand_media_placeholders(
     # A rollout batch is expanded once per data-iterator build, so a second pass sees the expanded ids.
     if num_placeholders == sum(counts):
         return tokens, loss_mask
-    assert num_placeholders == len(counts), (
-        f"{num_placeholders} media placeholder(s) in the tokens but {len(counts)} media token count(s) were shipped"
-    )
+    assert num_placeholders == len(
+        counts
+    ), f"{num_placeholders} media placeholder(s) in the tokens but {len(counts)} media token count(s) were shipped"
 
     repeats = torch.ones(len(tokens), dtype=torch.long, device=tokens.device)
     repeats[is_placeholder] = torch.tensor(counts, dtype=torch.long, device=tokens.device)
@@ -129,7 +128,8 @@ def _expand_inkling_rollout_data_in_place(rollout_data: RolloutBatch) -> None:
         )
 
 
-def expand_multimodal_rollout_data_in_place(rollout_data: RolloutBatch, qkv_format: str = "thd") -> None:
+def expand_multimodal_rollout_data_in_place(rollout_data: RolloutBatch) -> None:
+    """Runs before any per-token side channel is sliced, so only tokens, masks and lengths change here."""
     multimodal_train_inputs = rollout_data.get("multimodal_train_inputs", None)
     if multimodal_train_inputs is not None and any(
         mm is not None and ("mm_vision_num_patches" in mm or "mm_audio_num_tokens" in mm)
@@ -166,29 +166,6 @@ def expand_multimodal_rollout_data_in_place(rollout_data: RolloutBatch, qkv_form
 
     if expanded_total_lengths == old_total_lengths and expanded_response_lengths == old_response_lengths:
         return
-    # The per-token side channels were sliced for the unexpanded lengths; re-slice them for the new ones.
-    parallel_state = get_parallel_state()
-    if parallel_state.cp.size > 1 and qkv_format == "thd":
-        for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
-            values = rollout_data.get(key)
-            if not values:
-                continue
-            rollout_data[key] = [
-                slice_log_prob_with_cp(
-                    all_gather_with_cp(value, old_total_length, old_response_length),
-                    new_total_length,
-                    new_response_length,
-                    qkv_format,
-                )
-                for value, old_total_length, old_response_length, new_total_length, new_response_length in zip(
-                    values,
-                    old_total_lengths,
-                    old_response_lengths,
-                    expanded_total_lengths,
-                    expanded_response_lengths,
-                    strict=False,
-                )
-            ]
     logger.info(
         "Expanded media placeholders: total_lengths %s -> %s, response_lengths %s -> %s",
         old_total_lengths,

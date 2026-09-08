@@ -14,20 +14,12 @@ from tests.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="stage-a-cpu", labels=[])
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from miles.backends.training_utils import mm_data
 
 P = 151655
-
-
-@pytest.fixture(autouse=True)
-def _single_cp_rank(monkeypatch):
-    # a length change re-slices per-token side channels only under CP>1; pin CP=1 here
-    monkeypatch.setattr(mm_data, "get_parallel_state", lambda: SimpleNamespace(cp=SimpleNamespace(size=1)))
 
 
 def _rollout_data():

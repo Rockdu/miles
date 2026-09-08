@@ -5,10 +5,8 @@ import torch
 
 from miles.backends.training_utils import cp_utils
 from miles.backends.training_utils import data as data_utils
-from miles.backends.training_utils import mm_data
 from miles.backends.training_utils.loss_hub.opd import apply_opd_kl_to_advantages
 from miles.backends.training_utils.parallel import GroupInfo, ParallelState
-from miles.utils.media_expansion import KIMI_MEDIA_PLACEHOLDER_TOKEN_ID
 
 _ROLLOUT_LOG_PROBS = torch.tensor([-0.2, -1.3, -0.7, -2.1, -0.4, -3.2, -1.8])
 _OPD_VALUES = torch.tensor([0.1, 0.9, -0.3, 1.7, -1.1, 0.4, 2.3])
@@ -122,30 +120,3 @@ def test_sglang_opd_response_fields_follow_rollout_log_prob_cp_slice(
             advantages[0],
             1.0 - 0.5 * rollout_data[opd_key][0],
         )
-
-
-def test_multimodal_cp_reslices_precomputed_opd_reverse_kl(monkeypatch: pytest.MonkeyPatch) -> None:
-    rollout_data = {
-        "tokens": [torch.tensor([KIMI_MEDIA_PLACEHOLDER_TOKEN_ID, 1, 2])],
-        "loss_masks": [torch.ones(2, dtype=torch.int)],
-        "total_lengths": [3],
-        "response_lengths": [2],
-        "media_token_counts": [[4]],
-        "media_placeholder_token_ids": [KIMI_MEDIA_PLACEHOLDER_TOKEN_ID],
-        "opd_reverse_kl": [torch.tensor([0.1, 0.2])],
-    }
-    gathered_keys = []
-
-    monkeypatch.setattr(mm_data, "get_parallel_state", lambda: _parallel_state(cp_size=2))
-
-    def _all_gather(value: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        gathered_keys.append(value)
-        return value
-
-    monkeypatch.setattr(mm_data, "all_gather_with_cp", _all_gather)
-    monkeypatch.setattr(mm_data, "slice_log_prob_with_cp", lambda value, *args, **kwargs: value)
-
-    mm_data.expand_multimodal_rollout_data_in_place(rollout_data)
-
-    assert len(gathered_keys) == 1
-    assert gathered_keys[0] is rollout_data["opd_reverse_kl"][0]
