@@ -1,5 +1,19 @@
-"""Unit tests for Sample.strip_last_output_tokens."""
+"""Unit tests for Sample: strip_last_output_tokens, weight versions, engine prompt lengths.
 
+Engine prompt lengths per call (update_from_meta_info):
+
+    len(self.tokens) - len(output_token_logprobs) ──► sent ─┐
+                                                            ├─ equal ────► record
+    meta_info.prompt_tokens ────────────────────────► got ──┘
+                                                            └─ different ► off: record · warn: record + log · error: raise
+    meta_info without prompt_tokens ► nothing recorded
+"""
+
+from tests.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
+
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -119,8 +133,8 @@ class TestStripLastOutputTokens:
         assert len(s.weight_versions) == 2
 
 
-def _make_args() -> SimpleNamespace:
-    return SimpleNamespace(sglang_speculative_algorithm=None)
+def _make_args(**overrides) -> SimpleNamespace:
+    return SimpleNamespace(**{"sglang_speculative_algorithm": None, "engine_prompt_length_check": "warn", **overrides})
 
 
 def _make_meta_info(output_ids: list[int], **extra) -> dict:
@@ -331,3 +345,47 @@ class TestWeightVersions:
 
         s.weight_versions = [WeightVersionsPerCall(spans=[WeightVersionSpan("v1", 2, 4)])]
         assert s.oldest_weight_version is None
+
+
+class TestEnginePromptLengthsPerCall:
+    def test_equal_lengths_are_recorded_per_call(self):
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.update_from_meta_info(
+            _make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5], prompt_tokens=2)
+        )
+        s.tokens += [6, 7]
+        s.response_length += 2
+        s.update_from_meta_info(
+            _make_args(engine_prompt_length_check="error"), _make_meta_info([6, 7], prompt_tokens=5)
+        )
+        assert s.engine_prompt_lengths_per_call == [2, 5]
+
+    def test_missing_prompt_tokens_records_nothing(self):
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.update_from_meta_info(_make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5]))
+        assert s.engine_prompt_lengths_per_call == []
+
+    def test_mismatch_warns_and_records(self, caplog):
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.multimodal_inputs = {"images": [object()]}
+        with caplog.at_level(logging.WARNING, logger="miles.utils.types"):
+            s.update_from_meta_info(_make_args(), _make_meta_info([3, 4, 5], prompt_tokens=7))
+        assert s.engine_prompt_lengths_per_call == [7]
+        assert "prefilled 7 prompt tokens but miles sent 2" in caplog.text
+        assert "multimodal=True" in caplog.text
+
+    def test_mismatch_raises_in_error_mode(self):
+        s = _make_sample([1, 2], [3, 4, 5])
+        with pytest.raises(ValueError, match="re-tokenized the prompt"):
+            s.update_from_meta_info(
+                _make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5], prompt_tokens=7)
+            )
+
+    def test_mismatch_is_silent_when_off(self, caplog):
+        s = _make_sample([1, 2], [3, 4, 5])
+        with caplog.at_level(logging.WARNING, logger="miles.utils.types"):
+            s.update_from_meta_info(
+                _make_args(engine_prompt_length_check="off"), _make_meta_info([3, 4, 5], prompt_tokens=7)
+            )
+        assert s.engine_prompt_lengths_per_call == [7]
+        assert caplog.text == ""

@@ -1,3 +1,4 @@
+import logging
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -7,6 +8,7 @@ import torch
 
 from miles.utils.sampling_mask import RolloutSamplingMask
 
+logger = logging.getLogger(__name__)
 
 LEGACY_WEIGHT_VERSIONS_KEY = "legacy_weight_versions"
 
@@ -95,6 +97,7 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    engine_prompt_lengths_per_call: list[int] = field(default_factory=list)  # meta_info.prompt_tokens per call
     rollout_sampling_mask: RolloutSamplingMask | None = None
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
@@ -369,6 +372,20 @@ class Sample:
 
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
+
+        # Token-in/token-out: the engine must have prefilled exactly the ids miles sent this call.
+        if (engine_prompt_length := meta_info.get("prompt_tokens")) is not None:
+            self.engine_prompt_lengths_per_call.append(engine_prompt_length)
+            sent_prompt_length = len(self.tokens) - len(meta_info.get("output_token_logprobs") or [])
+            if engine_prompt_length != sent_prompt_length and args.engine_prompt_length_check != "off":
+                message = (
+                    f"rollout engine prefilled {engine_prompt_length} prompt tokens but miles sent {sent_prompt_length} "
+                    f"(sample index={self.index}, call {len(self.engine_prompt_lengths_per_call)}, "
+                    f"multimodal={bool(self.multimodal_inputs)}); the engine re-tokenized the prompt"
+                )
+                if args.engine_prompt_length_check == "error":
+                    raise ValueError(message)
+                logger.warning(message)
 
         self.weight_versions.append(WeightVersionsPerCall.from_meta_info(meta_info, output_end=len(self.tokens)))
 

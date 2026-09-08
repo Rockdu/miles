@@ -161,6 +161,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             reward=_merge_equal_value("reward"),
             loss_mask=a.loss_mask + [0] * obs_len + b.loss_mask,
             weight_versions=a.weight_versions + b.weight_versions,
+            engine_prompt_lengths_per_call=a.engine_prompt_lengths_per_call + b.engine_prompt_lengths_per_call,
             rollout_log_probs=a.rollout_log_probs + [0.0] * obs_len + b.rollout_log_probs,
             rollout_sampling_mask=sampling_mask,
             teacher_log_probs=_merge_optional_per_token("teacher_log_probs"),
