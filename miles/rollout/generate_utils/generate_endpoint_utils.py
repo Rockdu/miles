@@ -9,7 +9,8 @@ import numpy as np
 import pybase64
 
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
-from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+from miles.utils.media_expansion import media_expansion_spec_for_checkpoint
+from miles.utils.processing_utils import encode_image_for_rollout_engine, encode_multimodal_prompt
 from miles.utils.types import Sample
 
 
@@ -18,12 +19,15 @@ def compute_prompt_ids_from_sample(state, sample, tools=None):
     prompt = sample.prompt
 
     if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
-        processor_output = state.processor(text=prompt, **sample.multimodal_inputs)
-        prompt_ids = processor_output["input_ids"][0]
-
         # TODO shall we move it to other places? then can make this function immutable
-        sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
-
+        prompt_ids, sample.multimodal_train_inputs, sample.media_token_counts = encode_multimodal_prompt(
+            state.processor,
+            state.tokenizer,
+            media_expansion_spec_for_checkpoint(state.args.hf_checkpoint),
+            prompt,
+            sample.multimodal_inputs,
+            tools=tools,
+        )
         return prompt_ids
     else:
         if not isinstance(prompt, str):

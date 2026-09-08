@@ -98,6 +98,7 @@ class Sample:
     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     engine_prompt_lengths_per_call: list[int] = field(default_factory=list)  # meta_info.prompt_tokens per call
+    media_token_counts: list[int] = field(default_factory=list)  # tokens each prompt media placeholder expands to
     rollout_sampling_mask: RolloutSamplingMask | None = None
     rollout_routed_experts: numpy.ndarray | None = (
         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
@@ -273,10 +274,7 @@ class Sample:
         if self.rollout_routed_experts is not None:
             actual = len(self.rollout_routed_experts)
             expect = len(self.tokens) - 1
-            mm = self.multimodal_train_inputs or {}
-            extra = sum(
-                int(c) - 1 for key in ("mm_vision_num_patches", "mm_audio_num_tokens") for c in list(mm.get(key) or [])
-            )
+            extra = sum(count - 1 for count in self.media_token_counts)
             assert actual in (expect, expect + extra), (
                 f"rollout_routed_experts length ({actual}) != len(tokens) - 1 ({expect})"
                 f" or media-expanded ({expect + extra})"
@@ -335,6 +333,7 @@ class Sample:
         """
         self.tokens = []
         self.multimodal_train_inputs = None
+        self.media_token_counts = []
         self.response = ""
         self.response_length = 0
         self.reward = None
@@ -373,15 +372,18 @@ class Sample:
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
 
-        # Token-in/token-out: the engine must have prefilled exactly the ids miles sent this call.
+        # Token-in/token-out: the engine must have prefilled the ids miles sent this call, with each
+        # media placeholder expanded to the count miles computed and nothing else changed.
         if (engine_prompt_length := meta_info.get("prompt_tokens")) is not None:
             self.engine_prompt_lengths_per_call.append(engine_prompt_length)
             sent_prompt_length = len(self.tokens) - len(meta_info.get("output_token_logprobs") or [])
-            if engine_prompt_length != sent_prompt_length and args.engine_prompt_length_check != "off":
+            expected_prompt_length = sent_prompt_length + sum(count - 1 for count in self.media_token_counts)
+            if engine_prompt_length != expected_prompt_length and args.engine_prompt_length_check != "off":
                 message = (
-                    f"rollout engine prefilled {engine_prompt_length} prompt tokens but miles sent {sent_prompt_length} "
-                    f"(sample index={self.index}, call {len(self.engine_prompt_lengths_per_call)}, "
-                    f"multimodal={bool(self.multimodal_inputs)}); the engine re-tokenized the prompt"
+                    f"rollout engine prefilled {engine_prompt_length} prompt tokens but miles expected "
+                    f"{expected_prompt_length} ({sent_prompt_length} ids sent, {len(self.media_token_counts)} media "
+                    f"placeholders; sample index={self.index}, call {len(self.engine_prompt_lengths_per_call)}); "
+                    f"the engine re-tokenized or expanded the prompt differently"
                 )
                 if args.engine_prompt_length_check == "error":
                     raise ValueError(message)

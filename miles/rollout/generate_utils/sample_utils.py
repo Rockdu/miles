@@ -155,6 +155,7 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
             tokens=b.tokens,
             multimodal_inputs=_merge_equal_value("multimodal_inputs"),
             multimodal_train_inputs=_merge_equal_value("multimodal_train_inputs"),
+            media_token_counts=_merge_equal_value("media_token_counts"),
             response=a.response + obs_text + b.response,
             response_length=a.response_length + obs_len + b.response_length,
             label=_merge_equal_value("label"),

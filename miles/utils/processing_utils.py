@@ -12,6 +12,7 @@ from tokenizers import Tokenizer as RawTokenizer
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
 from miles.utils.hf_config import register_hf_config_aliases
+from miles.utils.media_expansion import MediaExpansionSpec
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,25 @@ def call_processor(processor, text, multimodal_inputs: dict | None = None):
 def extract_multimodal_train_inputs(processor_output: Mapping[str, Any]) -> dict[str, Any] | None:
     excluded_keys = {"input_ids", "attention_mask", "mm_token_type_ids"}
     return {key: value for key, value in processor_output.items() if key not in excluded_keys} or None
+
+
+def encode_multimodal_prompt(
+    processor, tokenizer, spec: MediaExpansionSpec | None, prompt, multimodal_inputs: dict, tools=None
+) -> tuple[list[int], dict[str, Any] | None, list[int]]:
+    """Prompt ids with one placeholder per media item, the tensors training needs, and per-item expansion counts."""
+    if spec is not None and spec.hf_processor_expands_prompt:
+        if not isinstance(prompt, str):
+            prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True, tools=tools)
+        assert not multimodal_inputs.get("videos"), "video prompts are not expanded from raw ids yet"
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        train_inputs = dict(processor.image_processor(images=multimodal_inputs["images"], return_tensors="pt"))
+    else:
+        processor_output = call_processor(processor, prompt, multimodal_inputs)
+        prompt_ids = processor_output["input_ids"][0]
+        prompt_ids = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
+        train_inputs = extract_multimodal_train_inputs(processor_output)
+    counts = spec.token_counts(train_inputs) if spec is not None else []
+    return prompt_ids, train_inputs, counts
 
 
 def load_processor(name_or_path: str, **kwargs):

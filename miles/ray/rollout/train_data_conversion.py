@@ -5,6 +5,7 @@ import torch
 
 from miles.utils import object_store
 from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
+from miles.utils.media_expansion import media_expansion_spec_for_checkpoint
 from miles.utils.multi_lora import is_multi_lora_enabled
 from miles.utils.object_store import ValueSpec
 from miles.utils.seqlen_balancing import get_seqlen_balanced_partitions
@@ -37,6 +38,8 @@ ROLLOUT_DATA_VALUE_SPEC: dict[str, ValueSpec] = {
     "rollout_ids": ValueSpec(codec="ndarray", dtype="int64"),
     "rollout_mask_sums": ValueSpec(codec="ndarray", dtype="int64"),
     "multimodal_train_inputs": ValueSpec(codec="ragged_tensor_dict"),
+    "media_token_counts": ValueSpec(codec="msgpack_ragged"),
+    "media_placeholder_token_ids": ValueSpec(codec="auto"),
     "prompt": ValueSpec(codec="msgpack_ragged"),
     "metadata": ValueSpec(codec="msgpack_ragged"),
     "weight_versions": ValueSpec(codec="msgpack_ragged"),
@@ -144,6 +147,11 @@ def convert_samples_to_train_data(
 
     if any(sample.multimodal_train_inputs is not None for sample in samples):
         train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+
+    if any(sample.media_token_counts for sample in samples):
+        train_data["media_token_counts"] = [sample.media_token_counts for sample in samples]
+        placeholder_token_ids = media_expansion_spec_for_checkpoint(args.hf_checkpoint).placeholder_token_ids
+        train_data["media_placeholder_token_ids"] = list(placeholder_token_ids)
 
     if any(sample.weight_versions for sample in samples):
         train_data["weight_versions"] = [[call.to_dicts() for call in sample.weight_versions] for sample in samples]
@@ -378,6 +386,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
         for key in [
             "tokens",
             "multimodal_train_inputs",
+            "media_token_counts",
             "response_lengths",
             "rewards",
             "truncated",
@@ -406,6 +415,7 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
         for key in [
             "raw_reward",
             "total_lengths",
+            "media_placeholder_token_ids",
             "dynamic_global_batch_size",
             "step_slots",
             "step_adapter_names",

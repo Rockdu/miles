@@ -2,17 +2,17 @@
 
 The rollout side emits one media placeholder/sentinel per media item; training
 expands it to the per-item token count so the LM sees a position per vision
-patch / audio frame. Two families live here: Kimi-VL / Kimi-K2.5 (grid-derived
-expansion of an in-vocab placeholder) and Inkling (out-of-vocab sentinels expanded
-to in-vocab placeholder runs with explicit positions). Kept separate from
-data.py (generic batching / CP slicing).
+patch / audio frame. Two families live here: in-vocab placeholders expanded in
+place from the counts the controller shipped (`media_token_counts`), and Inkling
+(out-of-vocab sentinels expanded to in-vocab placeholder runs with explicit
+positions). Kept separate from data.py (generic batching / CP slicing).
 """
 
 import logging
-from collections.abc import Sequence
 
 import torch
 
+from miles.utils.media_expansion import INKLING_AUDIO_SENTINEL_ID, INKLING_IMAGE_SENTINEL_ID
 from miles.utils.types import RolloutBatch
 
 from .cp_utils import all_gather_with_cp, slice_log_prob_with_cp
@@ -20,104 +20,32 @@ from .parallel import get_parallel_state
 
 logger = logging.getLogger(__name__)
 
-# Kimi-K2.5 / Kimi-VL media placeholder token id.
-KIMI_VL_MEDIA_TOKEN_ID = 163605
-# Kimi-VL tpool_patch_merger collapses a 2x2 spatial patch into one token.
-_KIMI_VL_MERGE_H = 2
-_KIMI_VL_MERGE_W = 2
 
-
-def _num_image_tokens_from_grid(
-    grid_thw: torch.Tensor, merge_h: int = _KIMI_VL_MERGE_H, merge_w: int = _KIMI_VL_MERGE_W
-) -> int:
-    _, h, w = grid_thw.tolist()
-    # tpool_patch_merger averages over the temporal dimension T, so the
-    # actual number of tokens per image depends only on the spatial grid.
-    return (h // merge_h) * (w // merge_w)
-
-
-def _expand_image_tokens_for_sample(
+def _expand_media_placeholders(
     tokens: torch.Tensor,
     loss_mask: torch.Tensor,
-    grid_thws: torch.Tensor,
-    media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
+    placeholder_token_ids: tuple[int, ...],
+    counts: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # TODO: expansion shifts token indices, so Sample.weight_versions span positions are not remapped and misalign here.
-    if grid_thws is None or len(grid_thws) == 0:
+    """Expand the i-th placeholder into counts[i] copies of itself; expanded response media carry no loss."""
+    # TODO: expansion shifts token indices, so Sample.weight_versions span positions are not remapped here.
+    is_placeholder = torch.isin(tokens, torch.tensor(placeholder_token_ids, device=tokens.device))
+    num_placeholders = int(is_placeholder.sum())
+    # A rollout batch is expanded once per data-iterator build, so a second pass sees the expanded ids.
+    if num_placeholders == sum(counts):
         return tokens, loss_mask
+    assert num_placeholders == len(counts), (
+        f"{num_placeholders} media placeholder(s) in the tokens but {len(counts)} media token count(s) were shipped"
+    )
 
-    placeholder_positions = (tokens == media_token_id).nonzero(as_tuple=True)[0]
-    if len(placeholder_positions) == 0:
-        return tokens, loss_mask
-
-    num_placeholders = len(placeholder_positions)
-    num_grids = len(grid_thws)
-    expected_total_image_tokens = sum(_num_image_tokens_from_grid(grid_thw) for grid_thw in grid_thws)
-    if num_placeholders == expected_total_image_tokens:
-        # Already pre-expanded. Keep this helper idempotent because the same
-        # rollout batch may pass through multiple normalization paths.
-        return tokens, loss_mask
-    if num_placeholders != num_grids:
-        logger.warning(
-            "K25 multimodal token mismatch before training: placeholders=%s, grids=%s",
-            num_placeholders,
-            num_grids,
-        )
-
-    merge_h, merge_w = _KIMI_VL_MERGE_H, _KIMI_VL_MERGE_W
-    prompt_len = len(tokens) - len(loss_mask)
-
-    expanded_tokens = tokens.clone()
-    expanded_mask = loss_mask.clone()
-
-    for i, pos in enumerate(reversed(placeholder_positions)):
-        pos = pos.item()
-        grid_idx = num_placeholders - 1 - i
-        if grid_idx >= num_grids:
-            continue
-
-        _, h, w = grid_thws[grid_idx].tolist()
-        num_image_tokens = (h // merge_h) * (w // merge_w)
-
-        expanded_placeholder = torch.full(
-            (num_image_tokens,), media_token_id, dtype=expanded_tokens.dtype, device=expanded_tokens.device
-        )
-        expanded_tokens = torch.cat([expanded_tokens[:pos], expanded_placeholder, expanded_tokens[pos + 1 :]])
-
-        if pos >= prompt_len:
-            mask_pos = pos - prompt_len
-            expanded_mask_tokens = torch.zeros(
-                num_image_tokens, dtype=expanded_mask.dtype, device=expanded_mask.device
-            )
-            expanded_mask = torch.cat([expanded_mask[:mask_pos], expanded_mask_tokens, expanded_mask[mask_pos + 1 :]])
-
-    return expanded_tokens, expanded_mask
+    repeats = torch.ones(len(tokens), dtype=torch.long, device=tokens.device)
+    repeats[is_placeholder] = torch.tensor(counts, dtype=torch.long, device=tokens.device)
+    prompt_length = len(tokens) - len(loss_mask)
+    expanded_loss_mask = loss_mask.repeat_interleave(repeats[prompt_length:])
+    expanded_loss_mask[is_placeholder[prompt_length:].repeat_interleave(repeats[prompt_length:])] = 0
+    return tokens.repeat_interleave(repeats), expanded_loss_mask
 
 
-def _collect_multimodal_grid_inputs(
-    multimodal_train_inputs: Sequence[dict[str, torch.Tensor] | None] | None,
-) -> list[dict[str, torch.Tensor] | None]:
-    if multimodal_train_inputs is None:
-        return []
-
-    mm_inputs_list = []
-    for mm_dict in multimodal_train_inputs:
-        if mm_dict is not None and "grid_thws" in mm_dict:
-            mm_inputs_list.append(mm_dict)
-        else:
-            mm_inputs_list.append(None)
-    return mm_inputs_list
-
-
-def _batch_has_media_placeholders(
-    tokens: Sequence[torch.Tensor],
-    media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
-) -> bool:
-    return any((token_tensor == media_token_id).any().item() for token_tensor in tokens)
-
-
-INKLING_IMAGE_SENTINEL_ID = -101
-INKLING_AUDIO_SENTINEL_ID = -102
 INKLING_MM_PLACEHOLDER_TOKEN_ID = 200023
 INKLING_MM_AUDIO_PLACEHOLDER_TOKEN_ID = 200025
 
@@ -201,11 +129,7 @@ def _expand_inkling_rollout_data_in_place(rollout_data: RolloutBatch) -> None:
         )
 
 
-def expand_multimodal_rollout_data_in_place(
-    rollout_data: RolloutBatch,
-    media_token_id: int = KIMI_VL_MEDIA_TOKEN_ID,
-    qkv_format: str = "thd",
-) -> None:
+def expand_multimodal_rollout_data_in_place(rollout_data: RolloutBatch, qkv_format: str = "thd") -> None:
     multimodal_train_inputs = rollout_data.get("multimodal_train_inputs", None)
     if multimodal_train_inputs is not None and any(
         mm is not None and ("mm_vision_num_patches" in mm or "mm_audio_num_tokens" in mm)
@@ -213,80 +137,62 @@ def expand_multimodal_rollout_data_in_place(
     ):
         _expand_inkling_rollout_data_in_place(rollout_data)
         return
-    mm_inputs_list = _collect_multimodal_grid_inputs(multimodal_train_inputs)
-    if not mm_inputs_list or not any(mm is not None for mm in mm_inputs_list):
+    counts_per_sample = rollout_data.get("media_token_counts")
+    if counts_per_sample is None or not any(counts_per_sample):
         return
+    placeholder_token_ids = tuple(rollout_data["media_placeholder_token_ids"])
 
     tokens = rollout_data["tokens"]
-    if not _batch_has_media_placeholders(tokens, media_token_id=media_token_id):
-        return
-
     loss_masks = rollout_data["loss_masks"]
     old_total_lengths = list(rollout_data["total_lengths"])
     old_response_lengths = list(rollout_data["response_lengths"])
 
-    token_or_mask_changed = False
     expanded_tokens = []
     expanded_loss_masks = []
-    expanded_total_lengths = []
-    expanded_response_lengths = []
-
-    for i, (token_tensor, loss_mask_tensor) in enumerate(zip(tokens, loss_masks, strict=False)):
-        if mm_inputs_list[i] is not None:
-            new_tokens, new_loss_mask = _expand_image_tokens_for_sample(
-                token_tensor,
-                loss_mask_tensor,
-                mm_inputs_list[i]["grid_thws"],
-                media_token_id=media_token_id,
+    for token_tensor, loss_mask_tensor, counts in zip(tokens, loss_masks, counts_per_sample, strict=True):
+        if counts:
+            token_tensor, loss_mask_tensor = _expand_media_placeholders(
+                token_tensor, loss_mask_tensor, placeholder_token_ids, counts
             )
-            token_or_mask_changed = token_or_mask_changed or (
-                (new_tokens.size(0) != token_tensor.size(0)) or (new_loss_mask.size(0) != loss_mask_tensor.size(0))
-            )
-            expanded_tokens.append(new_tokens)
-            expanded_loss_masks.append(new_loss_mask)
-            expanded_total_lengths.append(new_tokens.size(0))
-            expanded_response_lengths.append(new_loss_mask.size(0))
-        else:
-            expanded_tokens.append(token_tensor)
-            expanded_loss_masks.append(loss_mask_tensor)
-            expanded_total_lengths.append(old_total_lengths[i])
-            expanded_response_lengths.append(old_response_lengths[i])
+        expanded_tokens.append(token_tensor)
+        expanded_loss_masks.append(loss_mask_tensor)
+    expanded_total_lengths = [t.size(0) for t in expanded_tokens]
+    expanded_response_lengths = [m.size(0) for m in expanded_loss_masks]
 
     rollout_data["tokens"] = expanded_tokens
     rollout_data["loss_masks"] = expanded_loss_masks
     rollout_data["total_lengths"] = expanded_total_lengths
     rollout_data["response_lengths"] = expanded_response_lengths
 
-    metadata_changed = (expanded_total_lengths != old_total_lengths) or (
-        expanded_response_lengths != old_response_lengths
+    if expanded_total_lengths == old_total_lengths and expanded_response_lengths == old_response_lengths:
+        return
+    # The per-token side channels were sliced for the unexpanded lengths; re-slice them for the new ones.
+    parallel_state = get_parallel_state()
+    if parallel_state.cp.size > 1 and qkv_format == "thd":
+        for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
+            values = rollout_data.get(key)
+            if not values:
+                continue
+            rollout_data[key] = [
+                slice_log_prob_with_cp(
+                    all_gather_with_cp(value, old_total_length, old_response_length),
+                    new_total_length,
+                    new_response_length,
+                    qkv_format,
+                )
+                for value, old_total_length, old_response_length, new_total_length, new_response_length in zip(
+                    values,
+                    old_total_lengths,
+                    old_response_lengths,
+                    expanded_total_lengths,
+                    expanded_response_lengths,
+                    strict=False,
+                )
+            ]
+    logger.info(
+        "Expanded media placeholders: total_lengths %s -> %s, response_lengths %s -> %s",
+        old_total_lengths,
+        expanded_total_lengths,
+        old_response_lengths,
+        expanded_response_lengths,
     )
-    if metadata_changed:
-        parallel_state = get_parallel_state()
-        cp_size = parallel_state.cp.size
-        if cp_size > 1 and qkv_format == "thd":
-            for key in ("rollout_log_probs", "teacher_log_probs", "opd_reverse_kl"):
-                values = rollout_data.get(key)
-                if not values:
-                    continue
-                rollout_data[key] = [
-                    slice_log_prob_with_cp(
-                        all_gather_with_cp(value, old_total_length, old_response_length),
-                        new_total_length,
-                        new_response_length,
-                        qkv_format,
-                    )
-                    for value, old_total_length, old_response_length, new_total_length, new_response_length in zip(
-                        values,
-                        old_total_lengths,
-                        old_response_lengths,
-                        expanded_total_lengths,
-                        expanded_response_lengths,
-                        strict=False,
-                    )
-                ]
-        logger.info(
-            "Adjusted multimodal rollout metadata for Kimi VL: "
-            f"token_or_mask_changed={token_or_mask_changed}, "
-            f"total_lengths_changed={expanded_total_lengths != old_total_lengths}, "
-            f"response_lengths_changed={expanded_response_lengths != old_response_lengths}"
-        )

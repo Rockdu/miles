@@ -2,10 +2,11 @@
 
 Engine prompt lengths per call (update_from_meta_info):
 
-    len(self.tokens) - len(output_token_logprobs) ──► sent ─┐
-                                                            ├─ equal ────► record
-    meta_info.prompt_tokens ────────────────────────► got ──┘
-                                                            └─ different ► off: record · warn: record + log · error: raise
+    len(self.tokens) - len(output_token_logprobs) ──► sent
+    sent + Σ(media_token_counts − 1) ───────────────► expected ─┐
+                                                                ├─ equal ────► record
+    meta_info.prompt_tokens ────────────────────────► got ──────┘
+                                                                └─ different ► off: record · warn: record + log · error: raise
 """
 
 from tests.ci.ci_register import register_cpu_ci
@@ -361,16 +362,23 @@ class TestEnginePromptLengthsPerCall:
 
     def test_mismatch_warns_and_records(self, caplog):
         s = _make_sample([1, 2], [3, 4, 5])
-        s.multimodal_inputs = {"images": [object()]}
         with caplog.at_level(logging.WARNING, logger="miles.utils.types"):
             s.update_from_meta_info(_make_args(), _make_meta_info([3, 4, 5], prompt_tokens=7))
         assert s.engine_prompt_lengths_per_call == [7]
-        assert "prefilled 7 prompt tokens but miles sent 2" in caplog.text
-        assert "multimodal=True" in caplog.text
+        assert "prefilled 7 prompt tokens but miles expected 2 (2 ids sent, 0 media placeholders" in caplog.text
+
+    def test_media_placeholders_expand_the_expected_length(self):
+        # prompt [1, PAD] with one image of 64 tokens: the engine prefills 1 + 64 = 65
+        s = _make_sample([1, 2], [3, 4, 5])
+        s.media_token_counts = [64]
+        s.update_from_meta_info(_make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5], prompt_tokens=65))
+        assert s.engine_prompt_lengths_per_call == [65]
+        with pytest.raises(ValueError, match="expected 65 \\(2 ids sent, 1 media placeholders"):
+            s.update_from_meta_info(_make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5], prompt_tokens=2))
 
     def test_mismatch_raises_in_error_mode(self):
         s = _make_sample([1, 2], [3, 4, 5])
-        with pytest.raises(ValueError, match="re-tokenized the prompt"):
+        with pytest.raises(ValueError, match="expanded the prompt differently"):
             s.update_from_meta_info(
                 _make_args(engine_prompt_length_check="error"), _make_meta_info([3, 4, 5], prompt_tokens=7)
             )

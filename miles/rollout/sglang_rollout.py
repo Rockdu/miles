@@ -27,10 +27,10 @@ from miles.utils.lifecycle import TrajectoryLifecycle
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.misc import SingletonMeta, call_agent_abort_hook
 from miles.utils.multi_lora import make_rid, slot_lora_name
+from miles.utils.media_expansion import media_expansion_spec_for_checkpoint
 from miles.utils.processing_utils import (
-    call_processor,
     encode_image_for_rollout_engine,
-    extract_multimodal_train_inputs,
+    encode_multimodal_prompt,
     load_processor,
     load_tokenizer,
 )
@@ -156,10 +156,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         isinstance(sample.prompt, (list, tuple))
         or (sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()))
     ):
-        processor_output = call_processor(state.processor, sample.prompt, sample.multimodal_inputs)
-        prompt_ids = processor_output["input_ids"][0]
-        prompt_ids = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
-        sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
+        prompt_ids, sample.multimodal_train_inputs, sample.media_token_counts = encode_multimodal_prompt(
+            state.processor,
+            state.tokenizer,
+            media_expansion_spec_for_checkpoint(args.hf_checkpoint),
+            sample.prompt,
+            sample.multimodal_inputs or {},
+        )
     else:
         prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
 
