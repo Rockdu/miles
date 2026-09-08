@@ -1644,10 +1644,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["off", "warn", "error"],
                 default="warn",
                 help=(
-                    "What to do when the rollout engine reports a prompt length (meta_info.prompt_tokens) different "
-                    "from the number of input_ids miles sent, i.e. when the engine re-tokenized the prompt. Happens "
-                    "only for multimodal prompts whose expansion changed the token count; the trained sequence "
-                    "would then not be the one the engine sampled from."
+                    "Action when the rollout engine's prompt length (meta_info.prompt_tokens) differs from the number "
+                    "of input ids miles sent: the engine re-tokenized the prompt, so the trained sequence is not the "
+                    "one it sampled from."
                 ),
             )
             parser.add_argument(
