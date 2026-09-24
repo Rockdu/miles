@@ -11,7 +11,7 @@ from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer as RawTokenizer
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
 
-from miles.utils.hf_utils.config import register_hf_config_aliases
+from miles.utils.hf_utils.config import load_hf_config, register_hf_config_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,50 @@ def load_processor(name_or_path: str, **kwargs):
     if isinstance(proc, PreTrainedTokenizerBase) or not isinstance(proc, ProcessorMixin):
         proc = None
 
+    if proc is not None:
+        # process_vision_info only sees the processor, and Qwen3.5 shares its processor class and config with
+        # Qwen3-VL, so the checkpoint's model_type is the only way to tell them apart there.
+        proc._miles_model_type = _load_model_type(name_or_path, **kwargs)
+
     return proc
+
+
+def _load_model_type(name_or_path: str, **kwargs) -> str | None:
+    try:
+        config = load_hf_config(name_or_path, trust_remote_code=kwargs.get("trust_remote_code", False))
+    except (OSError, ValueError) as e:
+        logger.warning(f"Failed to load model config from {name_or_path}: {e}")
+        return None
+    return config.model_type
+
+
+# Model types whose images are resized straight into the HF image processor's pixel window.
+# Qwen3.6 checkpoints report the same model types.
+_SINGLE_RESIZE_MODEL_TYPES = frozenset({"qwen3_5", "qwen3_5_moe"})
+
+
+def _image_pixel_bounds(processor) -> dict[str, int]:
+    if getattr(processor, "_miles_model_type", None) not in _SINGLE_RESIZE_MODEL_TYPES:
+        return {}
+    size = processor.image_processor.size
+    return {"min_pixels": size["shortest_edge"], "max_pixels": size["longest_edge"]}
+
+
+def _with_image_pixel_bounds(prompt, bounds: dict[str, int]):
+    if not bounds or not isinstance(prompt, list):
+        return prompt
+    out = []
+    for message in prompt:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        content = [
+            {**bounds, **item} if isinstance(item, dict) and ("image" in item or "image_url" in item) else item
+            for item in content
+        ]
+        out.append({**message, "content": content})
+    return out
 
 
 def process_vision_info(prompt, processor):
@@ -177,6 +220,11 @@ def process_vision_info(prompt, processor):
     else:
         logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
         image_patch_size = DEFAULT_PATCH_SIZE
+    # For Qwen3.5, qwen_vl_utils' default min_pixels (4 * 32**2) is below the processor's (65536), so small
+    # images were resized twice: rounded here, then upsampled again by the processor, on CPU for training
+    # but on GPU in sglang, whose interpolations differ. Resizing straight into the processor's window
+    # leaves one resize and makes the processor's a no-op. Per-image min_pixels / max_pixels still win.
+    prompt = _with_image_pixel_bounds(prompt, _image_pixel_bounds(processor))
     images, videos = qwen_process_vision_info(prompt, image_patch_size=image_patch_size)
     multimodal_inputs = {"images": images, "videos": videos}
     return multimodal_inputs
