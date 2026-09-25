@@ -177,9 +177,24 @@ def process_vision_info(prompt, processor):
     else:
         logger.info(f"Using default patch size: {DEFAULT_PATCH_SIZE}")
         image_patch_size = DEFAULT_PATCH_SIZE
+    # qwen_vl_utils' default min_pixels is below the Qwen3-VL / Qwen3.5 image processor's, so the image
+    # processor resized small images a second time. Resize into its pixel window so the image processor keeps them.
+    image_pixel_window = {
+        "min_pixels": processor.image_processor.size["shortest_edge"],
+        "max_pixels": processor.image_processor.size["longest_edge"],
+    }
+    prompt = [_with_default_image_pixel_window(message, image_pixel_window) for message in prompt]
     images, videos = qwen_process_vision_info(prompt, image_patch_size=image_patch_size)
     multimodal_inputs = {"images": images, "videos": videos}
     return multimodal_inputs
+
+
+def _with_default_image_pixel_window(message: dict, image_pixel_window: dict[str, int]) -> dict:
+    """Return a copy of the message whose image items use image_pixel_window unless they set their own."""
+    if isinstance(message["content"], str):
+        return message
+    content = [{**image_pixel_window, **item} if item["type"] == "image" else item for item in message["content"]]
+    return {**message, "content": content}
 
 
 def encode_image_for_rollout_engine(image) -> str:
