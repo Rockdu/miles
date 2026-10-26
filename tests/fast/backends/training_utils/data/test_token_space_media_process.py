@@ -1,5 +1,6 @@
 import pytest
 import torch
+from sglang.srt.multimodal.modality import Modality
 from tests.fast.fixtures.sglang_config_fixtures import with_parser_defaults_and_sglang_config
 from transformers import BaseImageProcessor
 
@@ -7,24 +8,34 @@ from miles.backends.training_utils.data import token_space_media_process
 from miles.backends.training_utils.data.token_space_media_process import RolloutEngineProcessorArgs
 
 
+class _TextMropeStrategy:
+    @staticmethod
+    def compute_mrope_positions(output):
+        return torch.arange(len(output["input_ids"])).expand(3, -1), None
+
+
 class _RecordingProcessor:
+    strategy = _TextMropeStrategy()
+
     def __init__(self):
         self.calls = []
 
     async def process(self, **kwargs):
         self.calls.append(kwargs)
-        num_images = len(kwargs["image_data"])
+        num_tokens = len(kwargs["input_ids"])
         return {
             "input_ids": torch.tensor([kwargs["input_ids"]]),
-            "attention_mask": torch.ones(1, len(kwargs["input_ids"])),
-            "pixel_values": torch.full((num_images, 3), float(num_images)),
-            "image_grid_thw": torch.tensor([[1, 2, 2]] * num_images),
-            "mm_modalities": ["image"] * num_images,
-            "mm_spans": [(1, 3), (3, 5)],
+            "attention_mask": torch.ones(1, num_tokens),
+            "pixel_values": torch.full((2, 3), 2.0),
+            "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]]),
+            "mm_modalities": [Modality.IMAGE, Modality.IMAGE],
+            "mm_spans": [[(1, 3)], [(3, 5)]],
+            "mrope_positions": torch.arange(3 * num_tokens).view(3, num_tokens),
+            "mrope_position_delta": torch.tensor([[0]]),
         }
 
 
-def test_trainer_rebuilds_tensors_without_expanding_the_rollout_tokens(monkeypatch):
+def _rebuild(monkeypatch, multimodal_inputs, tokens):
     processor = _RecordingProcessor()
     monkeypatch.setattr(
         token_space_media_process,
@@ -33,14 +44,18 @@ def test_trainer_rebuilds_tensors_without_expanding_the_rollout_tokens(monkeypat
             core=processor, image_device="cuda:3"
         ),
     )
-    multimodal_inputs = [{"images": ["/shared/a.png", "/shared/b.png"]}, None]
-    tokens = [torch.tensor([1, 9, 9, 9, 9, 2, 5]), torch.tensor([1, 2])]
-
     train_inputs = token_space_media_process.compute_multimodal_train_inputs(
         object(),
         multimodal_inputs,
         tokens,
         device=torch.device("cpu"),
+    )
+    return processor, train_inputs
+
+
+def test_trainer_rebuilds_tensors_without_expanding_the_rollout_tokens(monkeypatch):
+    processor, train_inputs = _rebuild(
+        monkeypatch, [{"images": ["/shared/a.png", "/shared/b.png"]}], [torch.tensor([1, 9, 9, 9, 9, 2, 5])]
     )
 
     (call,) = processor.calls
@@ -51,8 +66,7 @@ def test_trainer_rebuilds_tensors_without_expanding_the_rollout_tokens(monkeypat
     # As the engine's wrapper: the derived image device, and no video device.
     assert call["image_device"] == "cuda:3"
     assert "video_device" not in call
-    assert train_inputs[1] is None
-    assert set(train_inputs[0]) == {"pixel_values", "image_grid_thw"}
+    assert call["compute_mrope_positions"] is True
     assert torch.equal(train_inputs[0]["image_grid_thw"], torch.tensor([[1, 2, 2], [1, 2, 2]]))
 
 
@@ -106,3 +120,19 @@ def test_image_device_follows_the_engine_wrapper(monkeypatch, backend, image_pro
 
     assert image_device == expected
     assert calls == ([3] if expected else [])
+
+
+def test_placement_and_mrope_come_from_sglang(monkeypatch):
+    _, (media, text) = _rebuild(
+        monkeypatch,
+        [{"images": ["/shared/a.png", "/shared/b.png"]}, None],
+        [torch.tensor([1, 9, 9, 9, 9, 2, 5]), torch.tensor([1, 2])],
+    )
+
+    assert set(media) == {"pixel_values", "image_grid_thw", "mm_image_positions", "mrope_position_ids"}
+    # Every tower output row, at the tokens of its media's half-open spans.
+    assert media["mm_image_positions"].tolist() == [1, 2, 3, 4]
+    # Token-major, so samples concatenate along dim 0.
+    assert media["mrope_position_ids"].shape == (7, 3)
+    assert media["mrope_position_ids"][:, 1].tolist() == list(range(7, 14))
+    assert text["mrope_position_ids"].tolist() == [[0, 0, 0], [1, 1, 1]]
