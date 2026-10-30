@@ -5,9 +5,10 @@ other pipeline stages swallow the multimodal kwargs. The tower lives in ``model.
 submodule), so the optimizer, checkpoints, weight sync and ``named_parameters`` never see it.
 
 Where each row goes comes from SGLang's token-space processor on the trainer (``mm_spans``), the same
-computation the rollout engines run: ``mm_image_positions`` / ``mm_video_positions`` hold the token index of
-every tower output row in the natural packed row (``get_batch`` shifts each sample's positions by its offset).
-The mRoPE positions reach the model as its ``position_ids``, untouched here.
+computation the rollout engines run. ``get_batch`` turns those token indices into ``mm_image_positions`` /
+``mm_video_positions``: the row of this rank's packed input for every tower output row, -1 where another
+context-parallel rank holds the token. Every CP rank runs the tower on all of its micro-batch's media. The
+mRoPE positions reach the model as its ``position_ids``, untouched here.
 """
 
 import torch
@@ -78,7 +79,7 @@ def wire_mm_towers(model, hf_checkpoint: str) -> None:
 
 
 def _scatter_rows(decoder_input: torch.Tensor, rows: torch.Tensor, positions: torch.Tensor, *, sp_rank: int):
-    """Write ``rows`` at the natural packed ``positions`` that fall in this rank's [s_local, 1, h] window."""
+    """Write ``rows`` at the packed ``positions`` that fall in this rank's [s_local, 1, h] window; -1 skips a row."""
     s_local = decoder_input.shape[0]
     local = positions - sp_rank * s_local
     keep = (local >= 0) & (local < s_local)

@@ -144,8 +144,6 @@ def qwen3_5_mm_model_provider(
             "set --multimodal-token-space-processing"
         )
     backend = args.backend
-    if backend.context_parallel_size > 1:
-        raise ValueError("the Qwen3.5 multimodal model does not support context parallelism yet")
     if backend.mtp_num_layers:
         raise ValueError("the Qwen3.5 multimodal model is built without MTP layers")
     if backend.fp8_param_gather:
