@@ -146,6 +146,8 @@ def qwen3_5_mm_model_provider(
     backend = args.backend
     if backend.mtp_num_layers:
         raise ValueError("the Qwen3.5 multimodal model is built without MTP layers")
+    if backend.overlap_moe_expert_parallel_comm:
+        raise ValueError("the Qwen3.5 multimodal model merges media in forward, which the 1F1B schedule plan skips")
     if backend.fp8_param_gather:
         raise ValueError("the Qwen3.5 multimodal model does not support --fp8-param-gather")
 
