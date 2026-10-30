@@ -21,6 +21,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
+from miles.backends.training_utils.weight_update.hf_weight_iterator.checkpoint_towers import load_checkpoint_towers
+
 
 @dataclass(frozen=True)
 class Qwen3_5VisionConfig:
@@ -228,21 +230,14 @@ def _rot_pos_ids(h: int, w: int, merge: int) -> torch.Tensor:
 
 def load_vision_tower(hf_checkpoint: str, *, device: torch.device, dtype: torch.dtype) -> Qwen3_5VisionTower:
     """Build the frozen tower from a Qwen3.5 checkpoint's ``model.visual.*`` tensors."""
-    from safetensors import safe_open
-
-    root = Path(hf_checkpoint)
     tower = Qwen3_5VisionTower(
-        Qwen3_5VisionConfig.from_hf(json.loads((root / "config.json").read_text())["vision_config"])
+        Qwen3_5VisionConfig.from_hf(json.loads((Path(hf_checkpoint) / "config.json").read_text())["vision_config"])
     )
-    weight_map = json.loads((root / "model.safetensors.index.json").read_text())["weight_map"]
-    by_shard: dict[str, list[str]] = {}
-    for key in tower.state_dict():
-        by_shard.setdefault(weight_map[f"model.visual.{key}"], []).append(key)
-    state = {}
-    for shard, keys in sorted(by_shard.items()):
-        with safe_open(root / shard, framework="pt", device="cpu") as reader:
-            for key in keys:
-                state[key] = reader.get_tensor(f"model.visual.{key}")
+    state = {
+        name.removeprefix("model.visual."): tensor
+        for name, tensor in load_checkpoint_towers(hf_checkpoint)
+        if name.startswith("model.visual.")
+    }
     tower.load_state_dict(state, strict=True)
     tower.to(device=device, dtype=dtype)
     tower.requires_grad_(False)
