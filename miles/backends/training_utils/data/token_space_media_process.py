@@ -5,12 +5,12 @@ processor tensors. Each trainer rank rebuilds the tensors with SGLang's ``TokenS
 the same core the rollout engines serve with, built from their server args the way they build it,
 so training sees the features the rollout engines saw.
 
-Besides the processor tensors, each sample carries what SGLang computes from the expanded tokens:
+Besides the processor tensors, each sample gets what SGLang computes from the expanded tokens:
 
 - ``mm_image_positions`` / ``mm_video_positions``: [num_rows] sample-local token index of every vision tower
   output row, from the processor's ``mm_spans``;
-- ``mrope_position_ids``: [num_tokens, 3] mRoPE positions, token-major so the samples of a micro-batch
-  concatenate along dim 0. Text-only samples carry them too.
+- its mRoPE positions, [num_tokens, 3], text-only samples included. They are not multimodal inputs but the
+  model's ``position_ids``, so they travel apart; ``get_batch`` packs them like the tokens.
 """
 
 import asyncio
@@ -23,6 +23,13 @@ from typing import Any, NamedTuple
 import torch
 
 from miles.utils.processing_utils import extract_multimodal_train_inputs
+
+
+class TokenSpaceTrainInputs(NamedTuple):
+    # Each sample's processor tensors and tower row placement, or None for a text-only sample.
+    multimodal_train_inputs: list[dict[str, torch.Tensor] | None]
+    # Each sample's [num_tokens, 3] mRoPE positions, or None for a model without mRoPE.
+    mrope_position_ids: list[torch.Tensor] | None
 
 
 @dataclass(frozen=True)
@@ -69,28 +76,30 @@ def compute_multimodal_train_inputs(
     tokens: Sequence[torch.Tensor],
     *,
     device: torch.device,
-) -> list[dict[str, torch.Tensor] | None]:
-    """Rebuild each sample's processor tensors on the trainer from its media references and expanded tokens.
+) -> TokenSpaceTrainInputs:
+    """Rebuild each sample's processor tensors and mRoPE positions on the trainer from its media references.
 
     Args:
         rollout_engine_args: The rollout engines' server args that decide the processor output.
         multimodal_inputs: Each sample's media references, or None for a text-only sample.
         tokens: Each sample's tokens, with the media placeholders SGLang expanded.
         device: This rank's device; the tensors land here, and it stands in for the engine's GPU.
-
-    Returns:
-        Each sample's ``multimodal_train_inputs``; a text-only sample has only its mRoPE positions, or None for a
-        model without mRoPE.
     """
     trainer_processor = _trainer_processor(rollout_engine_args, device)
-    return [
+    samples = [
         (
             _sample_train_inputs(trainer_processor, sample_multimodal_inputs, sample_tokens, device=device)
             if sample_multimodal_inputs
-            else _text_train_inputs(trainer_processor, sample_tokens)
+            else (None, _text_mrope_positions(trainer_processor, sample_tokens))
         )
         for sample_multimodal_inputs, sample_tokens in zip(multimodal_inputs, tokens, strict=True)
     ]
+    train_inputs, mrope_positions = zip(*samples, strict=True) if samples else ((), ())
+    if all(positions is None for positions in mrope_positions):
+        return TokenSpaceTrainInputs(list(train_inputs), None)
+    assert all(positions is not None for positions in mrope_positions), "mRoPE positions for only some samples"
+    mrope_position_ids = [positions.T.contiguous().to(device) for positions in mrope_positions]
+    return TokenSpaceTrainInputs(list(train_inputs), mrope_position_ids)
 
 
 class _TrainerProcessor(NamedTuple):
@@ -203,13 +212,9 @@ def _sample_train_inputs(
         ]
         if rows:
             train_inputs[key] = torch.cat(rows).to(device)
-    if mrope_positions is not None:
-        train_inputs["mrope_position_ids"] = mrope_positions.T.contiguous().to(device)
-    return train_inputs
+    return train_inputs, mrope_positions
 
 
-def _text_train_inputs(trainer_processor: _TrainerProcessor, tokens: torch.Tensor):
+def _text_mrope_positions(trainer_processor: _TrainerProcessor, tokens: torch.Tensor) -> torch.Tensor | None:
     mrope_positions, _ = trainer_processor.core.strategy.compute_mrope_positions({"input_ids": tokens.tolist()})
-    if mrope_positions is None:
-        return None
-    return {"mrope_position_ids": mrope_positions.T.contiguous().to(tokens.device)}
+    return mrope_positions

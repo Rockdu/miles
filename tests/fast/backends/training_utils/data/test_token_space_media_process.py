@@ -67,7 +67,7 @@ def test_trainer_rebuilds_tensors_without_expanding_the_rollout_tokens(monkeypat
     assert call["image_device"] == "cuda:3"
     assert "video_device" not in call
     assert call["compute_mrope_positions"] is True
-    assert torch.equal(train_inputs[0]["image_grid_thw"], torch.tensor([[1, 2, 2], [1, 2, 2]]))
+    assert torch.equal(train_inputs.multimodal_train_inputs[0]["image_grid_thw"], torch.tensor([[1, 2, 2], [1, 2, 2]]))
 
 
 def test_rollout_engine_args_read_the_parsed_engine_config():
@@ -123,16 +123,19 @@ def test_image_device_follows_the_engine_wrapper(monkeypatch, backend, image_pro
 
 
 def test_placement_and_mrope_come_from_sglang(monkeypatch):
-    _, (media, text) = _rebuild(
+    _, train_inputs = _rebuild(
         monkeypatch,
         [{"images": ["/shared/a.png", "/shared/b.png"]}, None],
         [torch.tensor([1, 9, 9, 9, 9, 2, 5]), torch.tensor([1, 2])],
     )
 
-    assert set(media) == {"pixel_values", "image_grid_thw", "mm_image_positions", "mrope_position_ids"}
+    media, text = train_inputs.multimodal_train_inputs
+    assert set(media) == {"pixel_values", "image_grid_thw", "mm_image_positions"}
+    assert text is None
     # Every tower output row, at the tokens of its media's half-open spans.
     assert media["mm_image_positions"].tolist() == [1, 2, 3, 4]
-    # Token-major, so samples concatenate along dim 0.
-    assert media["mrope_position_ids"].shape == (7, 3)
-    assert media["mrope_position_ids"][:, 1].tolist() == list(range(7, 14))
-    assert text["mrope_position_ids"].tolist() == [[0, 0, 0], [1, 1, 1]]
+    # The positions travel apart from the processor tensors, token-major, text-only samples included.
+    media_positions, text_positions = train_inputs.mrope_position_ids
+    assert media_positions.shape == (7, 3)
+    assert media_positions[:, 1].tolist() == list(range(7, 14))
+    assert text_positions.tolist() == [[0, 0, 0], [1, 1, 1]]

@@ -138,6 +138,11 @@ def qwen3_5_mm_model_provider(
     """
     from miles_plugins.models.qwen3_5.mm_towers import wire_mm_towers
 
+    if not args.multimodal_token_space_processing:
+        raise ValueError(
+            "the Qwen3.5 multimodal model takes its mRoPE positions from SGLang's token-space processor; "
+            "set --multimodal-token-space-processing"
+        )
     backend = args.backend
     if backend.context_parallel_size > 1:
         raise ValueError("the Qwen3.5 multimodal model does not support context parallelism yet")
