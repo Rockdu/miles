@@ -143,6 +143,10 @@ def qwen3_5_mm_model_provider(
             "the Qwen3.5 multimodal model takes its mRoPE positions from SGLang's token-space processor; "
             "set --multimodal-token-space-processing"
         )
+    if args.qkv_format != "thd" or args.allgather_cp:
+        raise ValueError(
+            "the Qwen3.5 multimodal model packs its mRoPE positions per sample; use --qkv-format thd without --allgather-cp"
+        )
     backend = args.backend
     if backend.mtp_num_layers:
         raise ValueError("the Qwen3.5 multimodal model is built without MTP layers")
