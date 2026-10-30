@@ -355,7 +355,6 @@ def get_batch(
         return ids
 
     if (mrope_position_ids := batch.pop("mrope_position_ids", None)) is not None:
-        assert not get_position_ids, "mRoPE positions replace the 1D position ids"
         assert qkv_format == "thd" and not allgather_cp, "mRoPE positions need the per-sample THD CP layout"
         batch["position_ids"] = _pack_natural_position_ids(mrope_position_ids, cu_seqlens_host)
 

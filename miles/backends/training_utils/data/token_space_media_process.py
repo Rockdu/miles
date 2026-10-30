@@ -94,7 +94,7 @@ def compute_multimodal_train_inputs(
         )
         for sample_multimodal_inputs, sample_tokens in zip(multimodal_inputs, tokens, strict=True)
     ]
-    train_inputs, mrope_positions = zip(*samples, strict=True) if samples else ((), ())
+    train_inputs, mrope_positions = zip(*samples, strict=True)
     if all(positions is None for positions in mrope_positions):
         return TokenSpaceTrainInputs(list(train_inputs), None)
     assert all(positions is not None for positions in mrope_positions), "mRoPE positions for only some samples"
