@@ -89,4 +89,3 @@ def test_tower_rows_land_on_the_rank_holding_their_token(monkeypatch, cp_size):
     # Every row is placed exactly once across the CP ranks, at its own token.
     assert times_placed.eq(1).all()
     assert torch.equal(placed, expected)
-
