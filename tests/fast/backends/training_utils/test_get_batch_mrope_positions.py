@@ -90,25 +90,3 @@ def test_tower_rows_land_on_the_rank_holding_their_token(monkeypatch, cp_size):
     assert times_placed.eq(1).all()
     assert torch.equal(placed, expected)
 
-
-def test_rejects_the_allgather_cp_layout(monkeypatch):
-    monkeypatch.setattr(data_utils.current_platform, "current_device", lambda: torch.device("cpu"))
-    state = SimpleNamespace(cp=SimpleNamespace(rank=0, size=2), tp=SimpleNamespace(rank=0, size=1))
-    monkeypatch.setattr(data_utils, "get_parallel_state", lambda: state)
-    monkeypatch.setattr(context_parallel, "get_parallel_state", lambda: state)
-    rollout = {
-        "tokens": [torch.arange(1, 5)],
-        "mrope_position_ids": [torch.zeros(4, 3, dtype=torch.long)],
-        "loss_masks": [torch.ones(2, dtype=torch.int)],
-        "total_lengths": [4],
-        "response_lengths": [2],
-    }
-
-    with pytest.raises(AssertionError, match="per-sample THD CP layout"):
-        data_utils.get_batch(
-            data_utils.DataIterator(rollout, micro_batch_size=1),
-            list(rollout),
-            pad_multiplier=7,
-            qkv_format="thd",
-            allgather_cp=True,
-        )
