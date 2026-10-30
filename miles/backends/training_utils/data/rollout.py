@@ -392,7 +392,6 @@ def get_batch(
             sample_offsets.append(sample_offsets[-1] + t.size(0))
 
         def packed_rows(positions: torch.Tensor, sample_index: int) -> torch.Tensor:
-            # Token indices of a sample to rows of the packed input this rank holds.
             if qkv_format == "thd" and not allgather_cp:
                 return natural_to_local_cp_rows(
                     positions,

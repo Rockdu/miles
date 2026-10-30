@@ -84,6 +84,9 @@ def compute_multimodal_train_inputs(
         multimodal_inputs: Each sample's media references, or None for a text-only sample.
         tokens: Each sample's tokens, with the media placeholders SGLang expanded.
         device: This rank's device; the tensors land here, and it stands in for the engine's GPU.
+
+    Returns:
+        Each sample's processor tensors and, for a model with mRoPE, each sample's positions.
     """
     trainer_processor = _trainer_processor(rollout_engine_args, device)
     samples = [
