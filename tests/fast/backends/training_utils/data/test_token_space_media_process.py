@@ -35,7 +35,7 @@ class _RecordingProcessor:
         }
 
 
-def _rebuild(monkeypatch, multimodal_inputs, tokens):
+def _rebuild(monkeypatch, multimodal_inputs, tokens, *, with_sglang_placement=True):
     processor = _RecordingProcessor()
     monkeypatch.setattr(
         token_space_media_process,
@@ -48,6 +48,7 @@ def _rebuild(monkeypatch, multimodal_inputs, tokens):
         object(),
         multimodal_inputs,
         tokens,
+        with_sglang_placement=with_sglang_placement,
         device=torch.device("cpu"),
     )
     return processor, train_inputs
@@ -139,3 +140,18 @@ def test_placement_and_mrope_come_from_sglang(monkeypatch):
     assert media_positions.shape == (7, 3)
     assert media_positions[:, 1].tolist() == list(range(7, 14))
     assert text_positions.tolist() == [[0, 0, 0], [1, 1, 1]]
+
+
+def test_models_that_place_media_themselves_get_only_the_processor_tensors(monkeypatch):
+    """Megatron-Bridge and torch-native models take no placement kwargs and compute their own positions."""
+    processor, train_inputs = _rebuild(
+        monkeypatch,
+        [{"images": ["/shared/a.png", "/shared/b.png"]}, None],
+        [torch.tensor([1, 9, 9, 9, 9, 2, 5]), torch.tensor([1, 2])],
+        with_sglang_placement=False,
+    )
+
+    assert processor.calls[0]["compute_mrope_positions"] is False
+    assert set(train_inputs.multimodal_train_inputs[0]) == {"pixel_values", "image_grid_thw"}
+    assert train_inputs.multimodal_train_inputs[1] is None
+    assert train_inputs.mrope_position_ids is None

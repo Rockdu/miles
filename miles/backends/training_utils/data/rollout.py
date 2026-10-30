@@ -83,6 +83,8 @@ def get_rollout_data(
             RolloutEngineProcessorArgs.from_sglang_config(args.sglang),
             multimodal_inputs,
             rollout_data["tokens"],
+            # Megatron-Bridge and torch-native models place their media rows and rotate by themselves.
+            with_sglang_placement=args.train_backend == "megatron" and args.megatron_to_hf_mode == "raw",
             device=current_platform.current_device(),
         )
         rollout_data["multimodal_train_inputs"] = token_space_train_inputs.multimodal_train_inputs
